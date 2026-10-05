@@ -66,6 +66,8 @@ controls extension initialization, independently of the tool allowlist:
   global settings. Hosts needing extension-provided tools/providers must select `"ambient"`
   or supply their required tools/models directly; isolation does not import those extensions.
 
+Ambient workers use Pi's `createAgentSessionServices()` before resolving an explicit model. This loads extensions and registers both provider-config and native providers into the supplied model runtime before constructing the session. The same services are reused for session creation, so extensions are not loaded twice. Provider-registration errors surface as startup diagnostics; an unknown explicit model still fails rather than silently falling back. Isolated workers continue to skip ambient extensions.
+
 The executor retains a session through prompt, finish and artifact retries. Before delivering
 completion it stops progress subscriptions, aborts/settles Pi, emits `session_shutdown`
 (`reason: "quit"`) while extension contexts are still valid, disposes Pi and closes/drains
@@ -101,6 +103,8 @@ interface Runtime {
 The internal execution layer owns machine semantics, projection restoration, replay diagnostics, retention, and checkpoint cadence. Projector contract version 5 carries the invoke's recorded validation policy: a guard, explicit unguarded `null`, or unknown legacy omission. Removed-guard histories accept only matching recorded positive verdicts. Warning-only completed histories resume without a generic override; unresolved historical validation is blocked before executor construction/workspace materialization, even with an override. See [Recovery and safety](../safety.md#a-validator-was-removed). A runtime only interprets effects, returns machine events, and performs durable I/O. Runtime and storage never receive `BranchProjection` or interpret a checkpoint blob.
 
 `runEffects()` must arrange for every non-terminal effect except best-effort `cancel` to eventually produce the corresponding machine event. Effects are consumed in the supplied list order. Each `durable_records` effect is one indivisible storage commit: append every record in that effect together or append none, and never split it into multiple commits. Durable records must be committed before emitting `durable_records_added`; when one machine output contains multiple `durable_records` effects, each effect remains a separate atomic unit and both commits and acknowledgements preserve their supplied order.
+
+The machine groups adjacent, simultaneously admitted action starts into bounded commits of at most 32 `state_action/invoke` facts. Each invocation keeps its own durable row, sequence, parent, definition, and session identity; only the commit/acknowledgement boundary is shared. Dispatch reservations remain per invocation, and executors cannot start before their invocation group is acknowledged. Map/pool admission limits are applied before grouping. Completion/emit transactions, responses, actor admission reservations, and intervening effects are not merged. A runtime must not regroup effects on its own. Replay still consumes the individual facts in order, including historical prefixes within a committed group.
 
 ## `ChartRuntime`
 

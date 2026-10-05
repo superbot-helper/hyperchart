@@ -122,14 +122,18 @@ export class BranchExecution {
 	}
 
 	readonly prepareStampedCommit: PrepareStampedCommit = (records) => {
-		let next = this.projection;
+		// One private working copy per atomic commit. Never mutate the confirmed
+		// projection before storage confirms; checkpoint encoding snapshots each
+		// cadence boundary independently of the remaining records in this batch.
+		const next = structuredClone(this.projection);
 		let remaining = this.recordsSinceCheckpoint;
 		let checkpointable = this.checkpointableValue;
 		const checkpoints: OpaqueCheckpointEnvelope[] = [];
 		for (const record of records) {
 			const diagnostics = replayRecordDiagnostics(this.ast, next, record.seqId, record);
 			const skipped: ProjectionSkippedRecord[] = [];
-			next = this.projectFrom(next, [record], skipped);
+			projectBranch(next, this.ast, [record], [], skipped);
+			compactProjection(next, this.ast, this.retention);
 			checkpointable &&= diagnostics.stale.length === 0 && diagnostics.unpinned.length === 0 && skipped.length === 0;
 			remaining++;
 			if (remaining === PROJECTION_CHECKPOINT_INTERVAL) {
@@ -269,14 +273,4 @@ export class BranchExecution {
 		return prepareUserInteractionResponseFromProjection(this.projection, this.branchId, gate, input);
 	}
 
-	private projectFrom(
-		base: BranchProjection,
-		records: readonly DurableLogRecord[],
-		skipped?: ProjectionSkippedRecord[],
-	): BranchProjection {
-		const projected = structuredClone(base);
-		projectBranch(projected, this.ast, records, [], skipped);
-		compactProjection(projected, this.ast, this.retention);
-		return projected;
-	}
 }

@@ -2,8 +2,8 @@ import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from
 import { join } from "node:path";
 import {
 	type AgentSession,
-	createAgentSession,
-	DefaultResourceLoader,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
 	getAgentDir,
 	SessionManager,
 	type ModelRuntime,
@@ -496,22 +496,30 @@ export class PiAgentExecutor implements AgentExecutor {
 		]
 			.filter((part): part is string => part !== undefined && part.trim().length > 0)
 			.join("\n\n");
-		const model = modelRef === undefined ? undefined : resolveModel(this.options.modelRuntime, modelRef);
-		const resourceLoader = new DefaultResourceLoader({
+		// Services load extensions and register their providers before model lookup,
+		// matching Pi startup. Reloading a loader alone only queues registrations.
+		const services = await createAgentSessionServices({
 			cwd: this.options.workDir,
 			agentDir: this.agentDir,
-			noExtensions: this.options.extensionPolicy === "isolated",
-			...(plan.promptMode === "append"
-				? { appendSystemPromptOverride: (base: string[]) => [...base, invocationSystemPrompt] }
-				: {
-						systemPromptOverride: () => invocationSystemPrompt,
-						appendSystemPromptOverride: () => [],
-					}),
+			modelRuntime: this.options.modelRuntime,
+			resourceLoaderOptions: {
+				noExtensions: this.options.extensionPolicy === "isolated",
+				...(plan.promptMode === "append"
+					? { appendSystemPromptOverride: (base: string[]) => [...base, invocationSystemPrompt] }
+					: {
+							systemPromptOverride: () => invocationSystemPrompt,
+							appendSystemPromptOverride: () => [],
+						}),
+			},
 		});
-		await resourceLoader.reload();
 		if (isStopped()) {
 			return undefined;
 		}
+		const errors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error");
+		if (errors.length > 0) {
+			throw new Error(errors.map((diagnostic) => diagnostic.message).join("\n"));
+		}
+		const model = modelRef === undefined ? undefined : resolveModel(services.modelRuntime, modelRef);
 		const invokeSeqId = effectInvokeSeqId(effect.id);
 		let sessionHandle: PiSessionHandle | undefined;
 		if (this.options.sessionService !== undefined) {
@@ -538,15 +546,12 @@ export class PiAgentExecutor implements AgentExecutor {
 				: SessionManager.open(latest, dir, this.options.workDir));
 		let session: AgentSession;
 		try {
-			({ session } = await createAgentSession({
-				cwd: this.options.workDir,
-				agentDir: this.agentDir,
-				modelRuntime: this.options.modelRuntime,
+			({ session } = await createAgentSessionFromServices({
+				services,
 				...(model === undefined ? {} : { model }),
 				...(plan.thinkingLevel === undefined ? {} : { thinkingLevel: plan.thinkingLevel }),
 				...(tools === undefined ? {} : { tools }),
 				customTools: createInvocationCustomTools(effect, sink, this.options.schemaRegistry, overrides?.customTools),
-				resourceLoader,
 				sessionManager,
 			}));
 		} catch (error) {

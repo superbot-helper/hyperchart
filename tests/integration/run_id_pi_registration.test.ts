@@ -249,3 +249,67 @@ it("stopped-owned IDs autocomplete from authoritative metadata, excluding foreig
 	);
 	await h.hooks.get("session_shutdown")!({}, h.ctx);
 });
+
+for (const attached of [true, false]) {
+	it(`stop settles after runner death without a final status write (attached=${attached})`, async () => {
+		const f = await fixture("interrupted-stop");
+		vi.useFakeTimers();
+		let alive = true;
+		vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
+			if (signal === "SIGTERM") {
+				alive = false; // No final status write: interrupted runner cleanup.
+				return true;
+			}
+			if (alive) {
+				return true;
+			}
+			throw Object.assign(new Error("runner absent"), { code: "ESRCH" });
+		});
+		live(f, 800099);
+		const h = host(f.storage, f.root);
+		if (attached) {
+			await h.execute({ action: "run", runId: f.runId, branchId: "main" });
+		}
+		let settled = false;
+		const stopped = h.execute({ action: "stop", runId: f.runId }).then(() => {
+			settled = true;
+		});
+		await flush();
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(settled).toBe(true);
+		await stopped;
+		expect(withRunStorage(f.storage, () => readRunStatus(f.runId))).toMatchObject({
+			state: "stopped",
+			branchIds: [],
+			error: expect.stringContaining("cleanup could not be confirmed"),
+		});
+		expect(withRunStorage(f.storage, () => readRunStatus(f.runId)?.exitCode)).toBeUndefined();
+	});
+}
+
+it("stop keeps waiting while a stopping runner is still alive", async () => {
+	const f = await fixture("slow-stop");
+	vi.useFakeTimers();
+	let alive = true;
+	vi.spyOn(process, "kill").mockImplementation(() => {
+		if (alive) {
+			return true;
+		}
+		throw Object.assign(new Error("runner absent"), { code: "ESRCH" });
+	});
+	live(f, 800098);
+	const h = host(f.storage, f.root);
+	await h.execute({ action: "run", runId: f.runId, branchId: "main" });
+	let settled = false;
+	const stopped = h.execute({ action: "stop", runId: f.runId }).then(() => {
+		settled = true;
+	});
+	await flush();
+	await vi.advanceTimersByTimeAsync(25000);
+	expect(settled).toBe(false);
+	expect(withRunStorage(f.storage, () => readRunStatus(f.runId)?.state)).toBe("stopping");
+	alive = false;
+	await vi.advanceTimersByTimeAsync(1000);
+	expect(settled).toBe(true);
+	await stopped;
+});

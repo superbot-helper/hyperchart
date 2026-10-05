@@ -136,6 +136,10 @@ const piHyperchartHost: HyperchartHostAdapter;
 
 Singleton created with default options.
 
+## File-backed Pi transcripts
+
+`createPiFileTranscriptReader(runId)` is exported from `@surprisal/pi-hyperchart/pi-runner` for custom host configurations. Construct it inside the run's storage scope; it captures the sessions directory, resolves the requested session ID through run progress, and reads the contained Pi JSONL transcript. It returns `undefined` when no matching file is available. Journal storage and transcript storage are independent: a detached Pi runner may use a PostgreSQL journal and file-backed sessions. Hosts embedding `PiAgentExecutor` with a custom `sessionService` must supply that service's transcript reader instead.
+
 ## Agent tool
 
 The Pi extension registers one `hyperchart` tool. Set `action` to `list`, `inspect`, `run`, `run_inspect`, `view`, `branches`, `fork`, `rewind`, `stop`, or `respond`. The schema is not a JavaScript export. Every run-target action accepts only `runId`; directory aliases are rejected. `respond` requires the exact `(runId, branchId, seqId)`.
@@ -221,6 +225,8 @@ Rules:
 - `branchId` and `branchIds` are mutually exclusive. `branchIds` must be non-empty and unique. A fresh chart can select only singleton `main`; after forking durable heads, resume the existing run with an explicit `branchId` or `branchIds`. Omission is accepted only when the existing run has exactly one durable branch, which is inferred; a multi-branch run fails closed rather than silently selecting a head.
 - `wait` defaults to `false`.
 - `ignoreReplayWarnings` defaults to `false` and only bypasses stale/skipped replay warnings; it is not a structural repair.
+
+Terminal notifications support both JSONL and PostgreSQL storage. Pi's automatic user-gate presentation remains JSONL-only; terminal delivery and waited terminal receipts do not invoke that adapter for PostgreSQL. Background completion errors (including delivery or widget cleanup failures) are caught and logged instead of escaping as unhandled rejections in Pi. Undelivered outbox requests remain recoverable on session startup or `agent_settled`.
 
 Without `wait`, result details contain only the bounded startup result below. The owned terminal boundary is later injected as a compact model-facing follow-up only into the originating session/workDir and is receipted by request id; its durable full prompt payload is not copied into session JSONL. If an owned user gate is active, that gate wins: terminal delivery remains unclaimed in its durable outbox and is retried after the gate resolves and Pi settles.
 
@@ -388,7 +394,7 @@ Stop one run or every active run owned by current working directory. Exactly one
 { "action": "stop", "all": true }
 ```
 
-Live runners receive `SIGTERM`. Stale active statuses become `stopped` without signaling unrelated processes.
+Live runners receive `SIGTERM`. Stop waits for process exit, not just a terminal status write. If a runner exits while status is still `stopping`, the watcher reconciles it to `stopped` with a cleanup-unconfirmed diagnostic and no inferred successful exit code, so the stop tool cannot wait forever for a missing final write. A live stopping PID is never treated as finished based on heartbeat age. Stale active statuses become `stopped` without signaling unrelated processes.
 
 ### `action: "branches"`
 

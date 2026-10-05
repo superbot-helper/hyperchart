@@ -161,7 +161,7 @@ After editing this pattern, call `hyperchart` with `action: "inspect"`; do not r
 
 1. Inspect the chart first with `hyperchart` with `action: "inspect"`. It runs the same TypeScript/source-lint preflight as `run` and returns a bounded digest; full inspection is browser-only through `action: "view"`.
 2. Verify every named agent definition is available.
-3. Call `hyperchart({ action: "run", chartPath, args })`.
+3. Call `hyperchart({ action: "run", chartPath, args })`. Supply concrete argument values explicitly: chart `default` metadata is a launch suggestion, not runtime injection.
 4. Use `wait: true` only when the current task must block. Otherwise retain the returned run id; Pi routes owned gates and the terminal prompt to that exact originating session/canonical working directory. Do not start a polling watcher.
 5. A waited call can return terminal status **or** `boundary: "user"` for the globally active owned gate, possibly from another run that sorts earlier. Handle the gate before waiting again.
 6. Inspect the concrete result with `hyperchart({ action: "run_inspect", runId, branchId })` before reporting completion. `branchId` may be omitted only for a run with exactly one durable branch.

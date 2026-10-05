@@ -442,10 +442,11 @@ export function register(pi: ExtensionAPI, options: HyperchartExtensionOptions) 
 		const request = payload as HyperchartCommandRequest;
 		request.claim(async () =>
 			inStorageScope(async () => {
-				if (currentCtx === undefined) {
+				const ctx = currentCtx;
+				if (ctx === undefined) {
 					throw new Error("Hyperchart session context is not ready");
 				}
-				await invoke(currentCtx.cwd, () => dispatch(request.args, currentCtx!, false, delivery));
+				await invoke(ctx.cwd, () => dispatch(request.args, ctx, false, delivery));
 			}),
 		);
 	});
@@ -564,10 +565,10 @@ class PiUserInteractionCoordinator {
 
 	private async scanOnce(): Promise<void> {
 		const ctx = this.currentContext();
-		if (ctx === undefined || currentRunLogStorage()?.kind !== "jsonl") {
+		if (ctx === undefined) {
 			return;
 		}
-		const active = await acquireActiveUserInteraction(interactionOwner(ctx));
+		const active = await activePiUserInteraction(ctx);
 		if (active === undefined) {
 			this.state = { phase: "pending" };
 			const idle = typeof ctx.isIdle !== "function" || ctx.isIdle();
@@ -717,6 +718,12 @@ function interactionOwner(ctx: HyperchartContext): UserInteractionOwner {
 		sessionId: ctx.sessionManager.getSessionId(),
 		workDir: ctx.cwd,
 	};
+}
+
+// Pi's user-gate presentation is currently JSONL-only. Terminal notifications
+// and their receipts work with either backend and must not enter that adapter.
+async function activePiUserInteraction(ctx: HyperchartContext): Promise<OwnedUserInteraction | undefined> {
+	return currentRunLogStorage()?.kind === "jsonl" ? acquireActiveUserInteraction(interactionOwner(ctx)) : undefined;
 }
 
 function interactionKey(active: OwnedUserInteraction): string {
@@ -1909,14 +1916,14 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 			branchIds = [await unambiguousRunBranch("run", requestedRunId, ctx)];
 		}
 	}
+	const [branchId] = branchIds;
 	if (
-		branchIds.length === 0 ||
+		branchId === undefined ||
 		new Set(branchIds).size !== branchIds.length ||
 		branchIds.some((entry) => entry.trim().length === 0)
 	) {
 		throw new Error("branchIds must be non-empty and unique");
 	}
-	const branchId = branchIds[0]!;
 	if (meta === undefined && (branchIds.length !== 1 || branchId !== "main")) {
 		throw new Error(
 			"A fresh run must select exactly branch 'main'; start main, fork durable branches, then resume the existing run with branchId or branchIds",
@@ -1976,6 +1983,9 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 					"hyperchart",
 					currentRuns().active.size === 0 ? undefined : `▶ ${currentRuns().active.size} runs`,
 				);
+			})
+			.catch((error) => {
+				console.error(`Hyperchart background completion failed for ${runId}:`, error);
 			});
 		return { runId, chartId: parsed.ast.id, done };
 	}
@@ -2059,6 +2069,9 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 				"hyperchart",
 				currentRuns().active.size === 0 ? undefined : `▶ ${currentRuns().active.size} runs`,
 			);
+		})
+		.catch((error) => {
+			console.error(`Hyperchart background completion failed for ${runId}:`, error);
 		});
 	return { runId, chartId: parsed.ast.id, done };
 }
@@ -2080,7 +2093,7 @@ async function deliverPendingPiTerminalNotification(
 	}
 	// A visible or queued owned gate is the current conversational boundary. Leave the
 	// terminal outbox unclaimed so it remains recoverable after the gate is resolved.
-	if ((await acquireActiveUserInteraction(interactionOwner(ctx))) !== undefined) {
+	if ((await activePiUserInteraction(ctx)) !== undefined) {
 		return false;
 	}
 	recoverStaleRunTerminalNotification(runId);
@@ -2164,7 +2177,7 @@ function waitForPiRunBoundary(result: RunStartResult, ctx: HyperchartContext): P
 			}
 			inspecting = true;
 			try {
-				const active = await acquireActiveUserInteraction(interactionOwner(ctx));
+				const active = await activePiUserInteraction(ctx);
 				if (active === undefined) {
 					return;
 				}
@@ -2181,7 +2194,7 @@ function waitForPiRunBoundary(result: RunStartResult, ctx: HyperchartContext): P
 						{ source: "wait", leaseMs: USER_INTERACTION_WAIT_LEASE_MS },
 					);
 				}
-				const current = await acquireActiveUserInteraction(interactionOwner(ctx));
+				const current = await activePiUserInteraction(ctx);
 				if (current === undefined || interactionKey(current) !== interactionKey(active)) {
 					return;
 				}
@@ -2216,7 +2229,7 @@ async function receiptWaitedPiTerminalNotification(runId: string, ctx: Hyperchar
 	if (meta === undefined || meta.originSessionId !== sessionId || resolve(meta.workDir) !== resolve(ctx.cwd)) {
 		return undefined;
 	}
-	if ((await acquireActiveUserInteraction(interactionOwner(ctx))) !== undefined) {
+	if ((await activePiUserInteraction(ctx)) !== undefined) {
 		return undefined;
 	}
 	const request = readDeliverableTerminalNotificationRequest(runId);
@@ -2300,7 +2313,7 @@ function watchRun(runId: string): Promise<HyperchartRunStatus> {
 	return new Promise((resolveDone) => {
 		const timer = setInterval(
 			AsyncLocalStorage.bind(() => {
-				const status = readRunStatus(runId);
+				const status = reconcileStoppedRunner(runId);
 				if (status === undefined) {
 					return;
 				}
@@ -2322,6 +2335,21 @@ function watchRun(runId: string): Promise<HyperchartRunStatus> {
 		);
 		timer.unref();
 	});
+}
+
+// A runner can exit during shutdown before its final status write. Process death
+// ends the stop wait, but does not prove that application cleanup succeeded.
+function reconcileStoppedRunner(runId: string): HyperchartRunStatus | undefined {
+	const status = readRunStatus(runId);
+	if (status?.state === "stopping" && status.pid !== undefined && !isPidAlive(status.pid)) {
+		return patchRunStatus(runId, {
+			state: "stopped",
+			branchIds: [],
+			exitCode: undefined,
+			error: "runner exited during stop before recording completion; cleanup could not be confirmed",
+		});
+	}
+	return status;
 }
 
 async function statusCommand(ctx: HyperchartContext): Promise<void> {
@@ -2401,10 +2429,12 @@ async function stopOwnedRun(runId: string, ctx: HyperchartContext): Promise<{ ru
 	}
 	// A successful stop boundary means the runner has quiesced and cannot race a
 	// caller that immediately removes, rewinds, or reuses its run directory.
+	if (pid !== undefined) {
+		await waitForRunProcessExit(pid);
+		reconcileStoppedRunner(runId);
+	}
 	if (active !== undefined) {
 		await active.done;
-	} else if (pid !== undefined) {
-		await waitForRunProcessExit(pid);
 	}
 	if (currentRuns().get(runId) === active) {
 		currentRuns().remove(runId);
@@ -2880,7 +2910,7 @@ function parseResumeOptions(tokens: string[]): { runId: string; branchIds?: stri
 	const branchIds: string[] = [];
 	let ignoreReplayWarnings = false;
 	for (let index = 0; index < tokens.length; index++) {
-		const token = tokens[index]!;
+		const token = tokens[index];
 		if (token === "--ignore-replay-warnings") {
 			ignoreReplayWarnings = true;
 		} else if (token === "--branch") {

@@ -56,6 +56,28 @@ scripts/               build and package validation
 
 Durable history consumers use only snapshot-pinned cursor chunks from `RunHistoryStore`: public chunks are capped at 100 items and carry no reader handle. The oldest-first projection replay iterator is package-private, yields at most 500 facts per batch, and must not be imported by host, inspector, React, Pi, or Claude surfaces. Storage modules must remain AST/projector/host independent. `tests/run_history_boundary.test.ts` guards the package entrypoint, deleted materialized-log methods, caps, and import directions.
 
+### Execution hot-path performance
+
+Stamped-commit preparation uses one private projection copy per atomic batch. It
+still applies diagnostics and retention after each record, snapshots checkpoints
+at the same record boundaries, and publishes the new projection only after the
+storage commit. Abandoned or failed preparations must not affect confirmed state.
+
+Simultaneously admitted action starts are committed in bounded groups of at most
+32 invocation facts. Group only fresh adjacent invocation appends after admission
+and per-invocation deduplication; do not merge responses, completion/emit units,
+actor admissions, or intervening effects. Preserve acknowledgement ordering and
+verify restart both before commit and after commit but before acknowledgement.
+Trace capture must exercise a real invocation group. TLA consumes its individual
+facts: storage transaction grouping is outside the control-state abstraction.
+
+Template-path memoization retains at most 4,096 immutable string results, never
+ASTs or run state. Parallel/map join discovery visits shared ancestors once per
+scan and checks leaf completion before inspecting actors. These optimizations
+must preserve join ordering, actor drain requirements, replay output, and the
+checkpoint/log contract. Compare captured production facts before and after a
+change; distinguish pure projection timings from end-to-end runner throughput.
+
 ## Build and test
 
 Build all three packages (needed for bundled browser assets, distribution, and package validation):

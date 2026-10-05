@@ -28,11 +28,20 @@ export function canonicalMapKeys(instances: object): string[] {
 
 // The template path of a possibly-instanced path: map "#key" and actor "~generation"
 // suffixes are stripped per segment. Generation 1 deliberately has no suffix for stable paths.
+// Pure string results only: no AST or run state is retained. The bound prevents
+// unbounded map keys and actor generations from accumulating across long runs.
+const TEMPLATE_PATH_CACHE_LIMIT = 4096;
+const templatePaths = new Map<StatePath, StatePath>();
+
 export function templatePath(path: StatePath): StatePath {
 	if (!path.includes("#") && !path.includes("~") && !path.includes("$worker-")) {
 		return path;
 	}
-	return path
+	const cached = templatePaths.get(path);
+	if (cached !== undefined) {
+		return cached;
+	}
+	const template = path
 		.split(".")
 		.map((segment) => {
 			const hash = segment.indexOf("#");
@@ -41,6 +50,14 @@ export function templatePath(path: StatePath): StatePath {
 			return /^\$worker-[0-9]+$/.test(withoutGeneration) ? "$worker" : withoutGeneration;
 		})
 		.join(".");
+	if (templatePaths.size === TEMPLATE_PATH_CACHE_LIMIT) {
+		const oldest = templatePaths.keys().next();
+		if (!oldest.done) {
+			templatePaths.delete(oldest.value);
+		}
+	}
+	templatePaths.set(path, template);
+	return template;
 }
 
 export function nodeAt(ast: ChartAst, path: StatePath): StateAst | undefined {

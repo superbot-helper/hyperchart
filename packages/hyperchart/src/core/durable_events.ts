@@ -74,6 +74,7 @@ type SpawnedLog = {
 
 export type ResolvedStateInput = Readonly<Record<string, JsonValue>>;
 
+/** Independent invocation facts may share one atomic commit; each retains its own coordinates and session. */
 export type StateActionInvokeLog = {
 	type: "state_action";
 	kind: "invoke";

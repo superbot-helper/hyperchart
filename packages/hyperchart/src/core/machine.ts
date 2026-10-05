@@ -53,6 +53,7 @@ import {
 	actorStatePath,
 } from "./actors.js";
 import { actionUidKey } from "./action_uid.js";
+import { batchInvocationAppends } from "./invocation_batch.js";
 import { declaredArtifactsForState } from "./normalize.js";
 import {
 	allowedEventsForAction,
@@ -525,8 +526,11 @@ export function createMachineOutput(state: MachineState, responses: readonly (Ef
 		state.dispatched.add(entry.id);
 	}
 
+	// Keep per-invocation dispatch reservations, but acknowledge bounded groups of simultaneous
+	// starts together. No executor runs before its invocation group is durably acknowledged.
+	// Responses (including completion/emit units) retain their original commit boundaries.
 	// Appends remain unstamped until the selected branch writer commits them.
-	const effects = [...responses, ...fresh].map((entry) =>
+	const effects = [...responses, ...batchInvocationAppends(fresh)].map((entry) =>
 		entry.kind === "append" ? prepareAppend(state, entry) : entry,
 	);
 

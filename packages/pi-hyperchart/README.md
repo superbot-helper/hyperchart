@@ -34,6 +34,8 @@ The consolidated tool runs the same TypeScript/source-lint preflight for `inspec
 
 Asynchronous runs inject only a compact terminal boundary notice into the exact originating Pi session/workDir. An active owned user gate defers terminal delivery without receipting it. The extension never answers a gate automatically: hidden context tells the model to call `respond` only when the current prompt actually answers the displayed question; unrelated requests leave it open.
 `--wait`/`wait: true` waits for terminal status or a user boundary and returns bounded identifiers/status only. Gate response identities remain exact; bounded prompt/option labels carry original/omitted character counts and are separate from exact option values. Structured user gates carry a bounded recursive, non-executable output contract; if any identity or contract cannot remain sufficient within its caps, delivery fails closed and directs the operator to the browser inspector.
+Terminal notifications support JSONL and PostgreSQL storage; automatic Pi user-gate presentation remains JSONL-only. Background completion errors are contained and logged, with undelivered notifications recoverable on startup or agent settlement.
+Stop waits for the runner process to exit. If it dies before writing its final status, a lingering `stopping` state is reconciled with an explicit cleanup-unconfirmed diagnostic rather than hanging the tool.
 Terminal-notification delivery uses at-least-once semantics.
 Durable terminal request IDs and recoverable claims prevent permanent suppression after crash.
 The host may redeliver the same terminal notification after a crash between delivery and confirmation.
@@ -69,9 +71,11 @@ Supported actions:
 | `@surprisal/pi-hyperchart/package.json` | package metadata and Pi manifest |
 
 Embedded background workers can set `PiExecutorOptions.extensionPolicy: "isolated"`
-to avoid initializing interactive host extensions. The generic default is `"ambient"`.
+to avoid initializing interactive host extensions. The generic default is `"ambient"`. Ambient workers initialize Pi session services and extension providers before resolving the requested model; session creation reuses those services. Unknown explicit models still fail rather than falling back.
 Completed/replaced sessions are shut down and released after transcript durability and
 local retries; see the canonical [runtime API](https://github.com/surprisal-io/hyperchart/blob/main/docs/api/runtime.md#embedded-pi-workers).
+
+Custom host configurations can import `createPiFileTranscriptReader(runId)` from `@surprisal/pi-hyperchart/pi-runner` for detached Pi sessions, independently of the journal backend. Embedded workers with a custom session store require its own transcript reader. See the [Pi API](../../docs/api/pi.md#file-backed-pi-transcripts).
 
 ## Bundled documentation
 

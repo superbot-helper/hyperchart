@@ -1341,9 +1341,11 @@ function findCompletedParallel(
 ): { path: StatePath; target: StatePath } | undefined {
 	const candidates: { path: StatePath; target: StatePath }[] = [];
 	const seen = new Set<StatePath>();
+	const ancestors = new Set<StatePath>();
 	for (const leaf of projection.activeLeaves) {
 		let path = parentPath(leaf);
-		while (path !== undefined) {
+		while (path !== undefined && !ancestors.has(path)) {
+			ancestors.add(path);
 			const node = nodeAt(ast, path);
 			if (node === undefined) {
 				throw new Error(`Broken parent chain: state ${path} not found`);
@@ -1362,18 +1364,27 @@ function findCompletedParallel(
 	}
 	candidates.sort((a, b) => b.path.length - a.path.length);
 	return candidates.find(({ path }) => {
-		const leaves = projection.activeLeaves.filter((leaf) => underScope(leaf, path));
+		// Most joins are not ready. Avoid actor scans and temporary leaf arrays
+		// until all leaves under this scope are final.
+		let hasLeaves = false;
+		for (const leaf of projection.activeLeaves) {
+			if (!underScope(leaf, path)) {
+				continue;
+			}
+			if (nodeAt(ast, leaf)?.kind !== "final") {
+				return false;
+			}
+			hasLeaves = true;
+		}
+		if (!hasLeaves) {
+			return false;
+		}
 		const actors = projectedActorEndpoints(projection).filter(
 			(actor) => actor.owner !== undefined && underScope(actor.owner, path),
 		);
 		const mapOwnedDeclarations = Object.values(ast.actors).filter((actor) => actor.owner === templatePath(path));
 		const expectedActors = mapOwnedDeclarations.length * Object.keys(projection.spawns[path] ?? {}).length;
-		return (
-			leaves.length > 0 &&
-			leaves.every((leaf) => nodeAt(ast, leaf)?.kind === "final") &&
-			actors.length >= expectedActors &&
-			actors.every((actor) => actor.status === "stopped")
-		);
+		return actors.length >= expectedActors && actors.every((actor) => actor.status === "stopped");
 	});
 }
 
@@ -1381,6 +1392,9 @@ function findCompletedCompound(
 	projection: BranchProjection,
 	ast: ChartAst,
 ): { path: StatePath; target: StatePath } | undefined {
+	if (Object.keys(ast.actors).length === 0) {
+		return undefined;
+	}
 	const candidates: { path: StatePath; target: StatePath }[] = [];
 	for (const leaf of projection.activeLeaves) {
 		if (nodeAt(ast, leaf)?.kind !== "final") {

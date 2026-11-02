@@ -149,7 +149,7 @@ type ChartRuntimeOptions = {
 
 ## In-process runner controller
 
-`createHyperchartRunnerController()` prepares one parsed chart and shared journal, reserves the configured `branchId` or `branchIds` as initial seeds, and returns before launching them. `start()` launches those seeds only after their all-initial replay barrier and resolves when the aggregate runner terminates. `runHyperchartRunner()` is the compatibility wrapper that creates the controller and awaits `start()`. Signal shutdown waits for every branch disposal; cleanup failures are recorded in stopped status while the process still uses the signal-derived exit code.
+`createHyperchartRunnerController()` prepares one parsed chart and shared journal, reserves the configured `branchId` or `branchIds` as initial seeds, and returns before launching them. `start()` launches those seeds only after their all-initial replay barrier and resolves with a `RunnerOutcome` when the aggregate runner terminates: `state` (`complete`, `failed`, or `stopped`), the aggregate `error`, and each settled branch outcome, whose `results` are the accepted state results of a branch that reached a terminal state. A finished run replays to its terminal state and resolves without starting agents. `runHyperchartRunner()` is the compatibility wrapper that creates the controller and awaits `start()`. Signal shutdown waits for every branch disposal; cleanup failures are recorded in stopped status while the process still uses the signal-derived exit code.
 
 ```ts
 const controller = await createHyperchartRunnerController(config, buildExecutor);

@@ -11,6 +11,7 @@ import {
 	BranchSealedError,
 	createHyperchartRunnerController,
 	type HyperchartRunnerController,
+	type RunnerOutcome,
 	type SteerableAgentExecutor,
 } from "../../packages/hyperchart/src/runner/runner_main.js";
 import type { StorageEntry } from "../../packages/hyperchart/src/core/durable_events.js";
@@ -93,7 +94,7 @@ async function fixture(
 	disposeGates: ReadonlyMap<string, Promise<void>> = new Map(),
 ): Promise<{
 	controller: HyperchartRunnerController;
-	completion: Promise<void>;
+	completion: Promise<RunnerOutcome>;
 	executors: Map<string, PausingExecutor[]>;
 	runDir: string;
 }> {

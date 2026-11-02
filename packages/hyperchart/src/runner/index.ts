@@ -60,5 +60,6 @@ export type {
 	RunnerForkAndCommitUserInteractionOptions,
 	RunnerForkOptions,
 	RunnerHold,
+	RunnerOutcome,
 	SteerableAgentExecutor,
 } from "./runner_main.js";

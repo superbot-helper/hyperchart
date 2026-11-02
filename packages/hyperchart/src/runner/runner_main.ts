@@ -85,6 +85,16 @@ export type RunnerBranchOutcome = Readonly<{
 	error?: string;
 	/** Original local cleanup failure; not a durable log fact or transport identity. */
 	cause?: unknown;
+	/** Accepted results of a branch that reached a terminal state, by state path, from its projection. */
+	results?: Readonly<Record<string, unknown>>;
+}>;
+
+/** How a started controller ended: its aggregate terminal state, or stopped before one. */
+export type RunnerOutcome = Readonly<{
+	state: RunTerminalState | "stopped";
+	error?: string;
+	/** Settled outcome of every branch, in settlement order. */
+	branches: readonly RunnerBranchOutcome[];
 }>;
 
 export type RunnerForkOptions = Readonly<{
@@ -160,8 +170,8 @@ export interface HyperchartRunnerController {
 	readonly liveBranchIds: readonly BranchId[];
 	/** Live branches occupying execution capacity, including setup/drain but excluding journal-native open user gates. */
 	activeBranchIds(): Promise<readonly BranchId[]>;
-	/** Launch the reserved initial branches and resolve at aggregate termination. */
-	start(): Promise<void>;
+	/** Launch the reserved initial branches and resolve with the outcome at aggregate termination. */
+	start(): Promise<RunnerOutcome>;
 	/** Stop every live branch and close the controller without terminating the host process. */
 	stop(): Promise<void>;
 	/** Keep an accepting controller alive across idle gaps with no live branches. */
@@ -315,7 +325,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 		(outcome: RunTerminalState, error?: string) => TerminalNotificationPayload
 	>();
 	private readonly executors = new Map<BranchId, SteerableAgentExecutor>();
-	private readonly completion = deferred<void>();
+	private readonly completion = deferred<RunnerOutcome>();
 	private readonly initialReplayBarrier = deferred<void>();
 	private readonly initialSetupTurns: Deferred<void>[];
 	private readonly artifactStore: ArtifactStore;
@@ -410,7 +420,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 		return active.filter((branchId): branchId is BranchId => branchId !== undefined);
 	}
 
-	start(): Promise<void> {
+	start(): Promise<RunnerOutcome> {
 		if (!this.started) {
 			this.started = true;
 			if (this.phase === "accepting") {
@@ -1268,6 +1278,9 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 				return;
 			}
 			const classified = await entry.semantic.finalOutcome(state);
+			// The loop's terminal state is its own copy of the projection, never
+			// used again: its results are handed over without another copy.
+			const results = state.projection.results;
 			this.notificationRenderers.set(
 				entry.branchId,
 				entry.semantic.notificationRenderer(state, {
@@ -1279,6 +1292,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 				branchId: entry.branchId,
 				outcome: classified.terminal,
 				...(classified.error === undefined ? {} : { error: classified.error }),
+				results,
 			});
 		} catch (error) {
 			if (this.isRunnable(entry)) {
@@ -1459,10 +1473,11 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 		const failed = this.outcomes.filter((entry) => entry.outcome === "failed");
 		const terminalState: RunTerminalState = failed.length === 0 ? "complete" : "failed";
 		const representative = failed[0] ?? this.outcomes[0] ?? finalOutcome;
-		const error =
+		let error =
 			failed.length === 0
 				? undefined
 				: failed.map((entry) => `${entry.branchId}: ${entry.error ?? "machine failed"}`).join("; ");
+		let state = terminalState;
 		this.stopLifetimeResources();
 		try {
 			const renderNotification = this.notificationRenderers.get(representative.branchId);
@@ -1493,12 +1508,14 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 			const message = terminalError instanceof Error ? terminalError.message : String(terminalError);
 			patchRunStatus(this.config.runId, { state: "failed", branchIds: [], exitCode: 1, error: message });
 			process.exitCode = 1;
+			state = "failed";
+			error = message;
 		}
 		await this.rootStore
 			.close()
 			.catch((error: unknown) => console.warn(`Hyperchart journal close failed: ${errorMessage(error)}`));
 		this.phase = "closed";
-		this.completion.resolve();
+		this.completion.resolve({ state, ...(error === undefined ? {} : { error }), branches: [...this.outcomes] });
 	}
 
 	private publishLiveStatus(): void {
@@ -1633,21 +1650,27 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 			),
 		];
 		const exitCode = signal === "SIGTERM" ? 143 : 130;
+		const error =
+			cleanupErrors.length === 0
+				? undefined
+				: `Runner stopped by ${signal}; cleanup failed: ${cleanupErrors.join("; ")}`;
 		patchRunStatus(this.config.runId, {
 			state: "stopped",
 			branchIds: [],
 			pid: process.pid,
 			heartbeatAt: Date.now(),
 			exitCode,
-			...(cleanupErrors.length === 0
-				? { error: undefined }
-				: { error: `Runner stopped by ${signal}; cleanup failed: ${cleanupErrors.join("; ")}` }),
+			error,
 		});
 		await this.rootStore
 			.close()
 			.catch((error: unknown) => console.warn(`Hyperchart journal close failed: ${errorMessage(error)}`));
 		this.phase = "closed";
-		this.completion.resolve();
+		this.completion.resolve({
+			state: "stopped",
+			...(error === undefined ? {} : { error }),
+			branches: entries.map(stoppedOutcome),
+		});
 		if (exitProcess) {
 			process.exit(exitCode);
 		}

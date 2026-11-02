@@ -1199,3 +1199,33 @@ describePg("PostgresLogStore", () => {
 		expect(received).toEqual([`${runId}:1`, `${runId}:2`]);
 	});
 });
+
+describePg("PostgresLogStore schema creation", () => {
+	it("creates the schema once when writers open stores together on an empty database", async () => {
+		const pg = (await import("pg")).default;
+		const admin = new pg.Client({ connectionString: dsn as string });
+		await admin.connect();
+		const database = `hyperchart_schema_${randomUUID().replaceAll("-", "")}`;
+		await admin.query(`CREATE DATABASE ${database}`);
+		const url = new URL(dsn as string);
+		url.pathname = `/${database}`;
+		const stores: PostgresLogStore[] = [];
+		try {
+			const opened = await Promise.allSettled(
+				Array.from({ length: 8 }, (_, index) =>
+					PostgresLogStore.open({ dsn: url.toString(), runId: `schema-race-${index}`, access: "writer" }),
+				),
+			);
+			for (const result of opened) {
+				if (result.status === "fulfilled") {
+					stores.push(result.value);
+				}
+			}
+			expect(opened.filter((result) => result.status === "rejected")).toEqual([]);
+		} finally {
+			await Promise.all(stores.map((store) => store.close()));
+			await admin.query(`DROP DATABASE ${database}`);
+			await admin.end();
+		}
+	});
+});

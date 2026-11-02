@@ -296,9 +296,7 @@ export class PostgresLogStore implements RunLogStore {
 		const client = await connectPg(options.dsn, options.onWarn ?? (() => {}));
 		try {
 			if (access === "writer") {
-				await ensureJournalTable(client);
-				await ensureRunMetaTable(client);
-				await ensureCheckpointTable(client);
+				await ensureSchema(client);
 				const locked = await client.query(
 					"SELECT pg_try_advisory_lock(hashtextextended('hyperchart:run:' || $1, 0)) AS locked",
 					[options.runId],
@@ -1024,39 +1022,32 @@ async function connectPg(dsn: string, onWarn: (message: string) => void): Promis
 	await client.connect();
 	return client;
 }
-async function ensureRunMetaTable(client: PgClientLike): Promise<void> {
+/**
+ * Creates the journal, run-meta, and checkpoint tables and their indexes.
+ * `IF NOT EXISTS` does not serialize concurrent creators, so writers opening
+ * stores together on an empty database take one transaction-scoped advisory
+ * lock and create the schema one after another.
+ */
+async function ensureSchema(client: PgClientLike): Promise<void> {
+	await client.query("BEGIN");
 	try {
-		await client.query(RUN_META_DDL);
-	} catch (error) {
-		if (!isDuplicateObject(error)) {
-			throw error;
+		await client.query("SELECT pg_advisory_xact_lock(hashtextextended('hyperchart:schema', 0))");
+		for (const ddl of [
+			JOURNAL_DDL,
+			JOURNAL_PARENT_INDEX_DDL,
+			JOURNAL_BRANCH_INDEX_DDL,
+			JOURNAL_BRANCH_CREATE_INDEX_DDL,
+			RUN_META_DDL,
+			CHECKPOINT_DDL,
+			CHECKPOINT_IDENTITY_DDL,
+		]) {
+			await client.query(ddl);
 		}
-		await client.query(RUN_META_DDL);
-	}
-}
-async function ensureCheckpointTable(client: PgClientLike): Promise<void> {
-	try {
-		await client.query(CHECKPOINT_DDL);
+		await client.query("COMMIT");
 	} catch (error) {
-		if (!isDuplicateObject(error)) {
-			throw error;
-		}
-		await client.query(CHECKPOINT_DDL);
+		await client.query("ROLLBACK").catch(() => {});
+		throw error;
 	}
-	await client.query(CHECKPOINT_IDENTITY_DDL);
-}
-async function ensureJournalTable(client: PgClientLike): Promise<void> {
-	try {
-		await client.query(JOURNAL_DDL);
-	} catch (error) {
-		if (!isDuplicateObject(error)) {
-			throw error;
-		}
-		await client.query(JOURNAL_DDL);
-	}
-	await client.query(JOURNAL_PARENT_INDEX_DDL);
-	await client.query(JOURNAL_BRANCH_INDEX_DDL);
-	await client.query(JOURNAL_BRANCH_CREATE_INDEX_DDL);
 }
 
 async function listBranchesDirect(
@@ -1415,8 +1406,4 @@ function pgErrorConstraint(error: unknown): string | undefined {
 }
 function isUndefinedTable(error: unknown): boolean {
 	return pgErrorCode(error) === "42P01";
-}
-function isDuplicateObject(error: unknown): boolean {
-	const code = pgErrorCode(error);
-	return code === "42P07" || code === "23505";
 }

@@ -1,8 +1,10 @@
 import type { Runtime } from "../runtime/runtime.js";
 import { concatAsyncIterables } from "../utils/index.js";
 import { stepMachine, type MachineState, type MachineEvent } from "../core/machine.js";
+import type { ChartAst } from "../core/types.js";
 
 export interface ExecutionSession {
+	readonly ast: ChartAst;
 	isFresh(): boolean;
 	machineState(): MachineState;
 }
@@ -13,10 +15,26 @@ export async function start(
 	execution: ExecutionSession,
 	args?: Readonly<Record<string, unknown>>,
 ): Promise<MachineState> {
-	if (execution.isFresh() && args !== undefined) {
-		await runtime.runEffects([{ kind: "durable_records", id: "args", records: [{ type: "args", args }] }]);
+	const launchArgs = execution.isFresh() ? withDeclaredArgDefaults(execution.ast, args) : undefined;
+	if (launchArgs !== undefined) {
+		await runtime.runEffects([{ kind: "durable_records", id: "args", records: [{ type: "args", args: launchArgs }] }]);
 	}
 	return loop(runtime, execution);
+}
+
+// Every launch path funnels through start, so declared defaults are journaled with the args fact
+// here: omitted args take their chart default, explicitly provided args win.
+function withDeclaredArgDefaults(
+	ast: ChartAst,
+	args: Readonly<Record<string, unknown>> | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+	const defaults = Object.entries(ast.args ?? {}).flatMap(([name, declared]) =>
+		declared.default === undefined ? [] : [[name, structuredClone(declared.default)] as const],
+	);
+	if (defaults.length === 0) {
+		return args;
+	}
+	return { ...Object.fromEntries(defaults), ...args };
 }
 
 export async function loop(runtime: Runtime, execution: Pick<ExecutionSession, "machineState">): Promise<MachineState> {

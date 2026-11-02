@@ -22,7 +22,7 @@ export type ChartArgumentCst = {
 	description?: string;
 	/** Zod contract used for type metadata and default validation during normalization. */
 	schema?: SchemaCst;
-	/** Suggested launch value; hosts may let the user edit or omit it. */
+	/** Launch value used when the run omits this argument; hosts may let the user edit it. */
 	default?: JsonValue;
 };
 

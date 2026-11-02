@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	agent,
@@ -46,6 +47,10 @@ import type {
 	StateId,
 } from "../packages/hyperchart/src/index.js";
 import { failOnPullEvents, MockRuntime } from "./mock_runtime.js";
+import { ChartRuntime } from "../packages/hyperchart/src/runtime/generic/chart_runtime.js";
+import { MemoryLogStore } from "../packages/hyperchart/src/runtime/generic/memory_log_store.js";
+import { FakeAgentExecutor } from "./fake_agent_executor.js";
+import { collectHistoryRecords } from "./helpers/history.js";
 
 function linearAst(): ChartAst {
 	const result = normalizeChartConfig(
@@ -1240,6 +1245,60 @@ describe("execution loop", () => {
 				(record) => record.type === "state_action" && record.kind === "invoke" && record.actionUid.state === "plan",
 			),
 		).not.toHaveProperty("invocation");
+	});
+
+	it.each([
+		{ name: "without launch args", args: undefined, expected: { topic: "Hyperchart", depth: 2 } },
+		{
+			name: "with partial launch args",
+			args: { topic: "AI", extra: true },
+			expected: { topic: "AI", depth: 2, extra: true },
+		},
+	])("journals declared arg defaults for omitted args when started $name", async ({ args, expected }) => {
+		const parsed = normalizeChartConfig(
+			chart({
+				kind: "chart",
+				id: "arg-defaults-chart",
+				args: { topic: { default: "Hyperchart" }, depth: { schema: z.number(), default: 2 } },
+				initial: "plan",
+				states: {
+					plan: {
+						kind: "state",
+						action: agent("planner", { task: t`Plan ${arg("topic")} at depth ${arg("depth")}.` }),
+						transitions: { DONE: "done" },
+					},
+					done: final(),
+				},
+			}),
+		);
+		if (!parsed.ok) {
+			throw new Error("test chart should be valid");
+		}
+		const store = new MemoryLogStore();
+		const executor = new FakeAgentExecutor({ plan: [{ type: "DONE" }] });
+		const runtime = new ChartRuntime({
+			ast: parsed.ast,
+			branchId: "main",
+			logStore: store,
+			agentExecutor: executor,
+			workDir: tmpdir(),
+			chartDir: tmpdir(),
+		});
+		try {
+			const state = await start(runtime, args);
+
+			expect(state.projection.activeLeaves).toEqual(["done"]);
+			expect(state.projection.args).toEqual(expected);
+			expect(executor.starts.map((effect) => effect.task)).toEqual([
+				`Plan ${expected.topic} at depth ${expected.depth}.`,
+			]);
+			const records = await collectHistoryRecords(store, "main");
+			expect(records.filter((record) => record.type === "args")).toEqual([
+				expect.objectContaining({ type: "args", args: expected }),
+			]);
+		} finally {
+			await runtime.dispose();
+		}
 	});
 
 	it("fileOf reads inherit the producer's rendered path and content shape", async () => {

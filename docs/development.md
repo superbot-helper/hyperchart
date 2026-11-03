@@ -115,7 +115,7 @@ Run the standard gate:
 npm run check
 ```
 
-`check` only typechecks sources and runs fast tests; it does not clean or rebuild `dist`, run integration tests, or pack/install packages. On repeat runs, TypeScript reuses `node_modules/.cache/hyperchart-check.tsbuildinfo`. On release, run `npm run check:release`: fast checks, a single full build, all integration tests, then package validation (including tarballs, clean-consumer imports, packed Pi extension and skill). Run `npm run build-storybook` separately when UI stories change or before release.
+`check` only typechecks sources and runs fast tests; it does not clean or rebuild `dist`, run integration tests, or pack/install packages. Each package has two TypeScript configs with distinct roles: `tsconfig.json` is the editor and typecheck view, with `paths` that map `@surprisal/hyperchart/*` to the sibling package's sources so a stale `dist` never shows phantom errors; `tsconfig.build.json` adds `rootDir`/`outDir` and clears `paths`, so emitted code resolves the sibling through its published `exports` exactly like a consumer. Keep `paths` patterns with an explicit `*.ts` candidate: under NodeNext ESM resolution an extensionless candidate is never probed. On repeat runs, TypeScript reuses `node_modules/.cache/hyperchart-check.tsbuildinfo`. On release, run `npm run check:release`: fast checks, a single full build, all integration tests, then package validation (including tarballs, clean-consumer imports, packed Pi extension and skill). Run `npm run build-storybook` separately when UI stories change or before release.
 
 ## Storybook
 

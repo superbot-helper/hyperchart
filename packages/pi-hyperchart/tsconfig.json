@@ -1,6 +1,15 @@
 {
 	"extends": "../../tsconfig.base.json",
-	"compilerOptions": { "rootDir": "src", "outDir": "dist" },
-	"include": ["src/**/*.ts", "src/**/*.tsx"],
+	"compilerOptions": {
+		"noEmit": true,
+		"paths": {
+			"@surprisal/hyperchart": ["../hyperchart/src/index.ts"],
+			"@surprisal/hyperchart/internal/core/*": ["../hyperchart/src/core/*.ts", "../hyperchart/src/core/*"],
+			"@surprisal/hyperchart/internal/utils/*": ["../hyperchart/src/utils/*.ts", "../hyperchart/src/utils/*"],
+			"@surprisal/hyperchart/package.json": ["../hyperchart/package.json"],
+			"@surprisal/hyperchart/*": ["../hyperchart/src/*/index.ts"]
+		}
+	},
+	"include": ["src/**/*.ts", "src/**/*.tsx", "../hyperchart/src/react/react-syntax-highlighter.d.ts"],
 	"exclude": ["src/react/fixtures/**", "src/react/stories/**"]
 }

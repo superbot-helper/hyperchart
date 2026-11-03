@@ -1,5 +1,5 @@
 import { listRunIds, currentRunStorage, withRunStorage, type RunStorage } from "@surprisal/hyperchart/runtime";
-import { existsSync, readdirSync, realpathSync, writeSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	claimTerminalNotificationReceipt,
@@ -27,8 +27,16 @@ export type ClaudeMonitorOptions = {
 	storage?: RunStorage;
 	cwd: string;
 	sessionId?: string;
-	writeLine?: (line: string) => void;
+	/** Resolves once the line has been handed to the transport; a receipt is written only after that. */
+	writeLine?: (line: string) => void | Promise<void>;
 };
+
+/** Default transport: one physical stdout line, awaited until the stream accepts or errors. */
+function writeStdoutLine(line: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		process.stdout.write(`${line}\n`, (error) => (error === undefined || error === null ? resolve() : reject(error)));
+	});
+}
 
 /** Backwards-compatible name retained for callers that only scan terminal notifications. */
 export type ClaudeTerminalMonitorOptions = ClaudeMonitorOptions;
@@ -57,8 +65,8 @@ export async function pendingOwnedClaudeTerminalRequests(
 			if (canonicalPath(meta.workDir) !== canonicalPath(options.cwd) || meta.originSessionId !== options.sessionId) {
 				continue;
 			}
-			recoverStaleRunTerminalNotification(runId);
-			const request = readDeliverableTerminalNotificationRequest(runId);
+			await recoverStaleRunTerminalNotification(runId);
+			const request = await readDeliverableTerminalNotificationRequest(runId);
 			if (request === undefined || hasTerminalNotificationReceipt(runId, "claude", options.sessionId)) {
 				continue;
 			}
@@ -159,22 +167,18 @@ export async function emitPendingClaudeTerminalNotifications(options: ClaudeMoni
 	if (options.sessionId === undefined) {
 		return 0;
 	}
-	const writeLine =
-		options.writeLine ??
-		((line: string) => {
-			writeSync(process.stdout.fd, `${line}\n`);
-		});
+	const writeLine = options.writeLine ?? writeStdoutLine;
 	let delivered = 0;
 	for (const pending of await pendingOwnedClaudeTerminalRequests(options)) {
 		if (!claimTerminalNotificationReceipt(pending.runId, pending.request.requestId, "claude", options.sessionId)) {
 			continue;
 		}
-		if (readDeliverableTerminalNotificationRequest(pending.runId)?.requestId !== pending.request.requestId) {
+		if ((await readDeliverableTerminalNotificationRequest(pending.runId))?.requestId !== pending.request.requestId) {
 			continue;
 		}
 		// Confirm only after stdout accepts the line. A crash between write and confirmation
 		// intentionally permits at-least-once redelivery.
-		writeLine(
+		await writeLine(
 			serializeMonitorEnvelope({
 				customType: "hyperchart-terminal",
 				requestId: pending.request.requestId,
@@ -253,11 +257,7 @@ export async function emitPendingClaudeUserInteraction(options: ClaudeMonitorOpt
 	if (current === undefined || interactionKey(current) !== interactionKey(active)) {
 		return 0;
 	}
-	const writeLine =
-		options.writeLine ??
-		((line: string) => {
-			writeSync(process.stdout.fd, `${line}\n`);
-		});
+	const writeLine = options.writeLine ?? writeStdoutLine;
 	let notification: ClaudeMonitorEnvelope;
 	try {
 		notification = claudeUserInteractionNotification(current);
@@ -269,7 +269,7 @@ export async function emitPendingClaudeUserInteraction(options: ClaudeMonitorOpt
 			details: { error: "user-gate-summary-unavailable", seqId: current.request.seqId },
 		};
 	}
-	writeLine(serializeMonitorEnvelope(notification));
+	await writeLine(serializeMonitorEnvelope(notification));
 	markUserInteractionReceipt(
 		current.runId,
 		current.request.branchId,

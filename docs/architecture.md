@@ -139,7 +139,7 @@ Pi adds:
 - project/user discovery;
 - command, tool, TUI, and React surfaces.
 
-`status.json` and session progress are operational overlays. They do not replace `log.jsonl`.
+Run status (`status.json`, or `hyperchart_run_status` under PostgreSQL) and session progress are operational overlays. They do not replace `log.jsonl`.
 
 ## Inspector boundary
 

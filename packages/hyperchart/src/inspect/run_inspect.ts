@@ -81,7 +81,7 @@ export async function hyperchartRunFromRunId(
 		...(meta.exportName === undefined ? {} : { exportName: meta.exportName }),
 		...(agentDefaults === undefined ? {} : { agentDefaults }),
 	});
-	const status = options.snapshot === undefined ? readRunStatus(runId) : undefined;
+	const status = options.snapshot === undefined ? await readRunStatus(runId) : undefined;
 	const branchId = options.branchId ?? options.snapshot?.branchId ?? "main";
 	if (options.snapshot !== undefined && options.snapshot.branchId !== branchId) {
 		throw new Error("Inspector snapshot branch does not match selected branch");

@@ -378,7 +378,7 @@ async function readRunSummary(
 	if (resolve(meta.workDir) !== cwd) {
 		return undefined;
 	}
-	const persistedStatus = readRunStatus(runId);
+	const persistedStatus = await readRunStatus(runId);
 	const metaCreatedAt = Date.parse(meta.createdAt);
 	const createdAt = persistedStatus?.startedAt ?? (Number.isFinite(metaCreatedAt) ? metaCreatedAt : 0);
 	const updatedAt = persistedStatus?.updatedAt ?? (await runUpdatedAt(runId, createdAt));

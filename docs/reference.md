@@ -21,7 +21,7 @@ The [API index](api/README.md) lists every supported package entry point and the
 <run-dir>/
 ├── meta.json              # filesystem backend only
 ├── log.jsonl              # filesystem backend only
-├── status.json
+├── status.json            # filesystem backend only
 ├── runner.config.json
 ├── runner.stdout.log
 ├── runner.stderr.log
@@ -35,7 +35,7 @@ The [API index](api/README.md) lists every supported package entry point and the
     └── <branchId>/<actionUid>/<invocation>/
 ```
 
-The run directory remains the host control-plane root. Without PostgreSQL, `meta.json` and the append-only v2 journal `log.jsonl` are its fundamental durable files. With explicitly configured PostgreSQL storage, run identity lives in `hyperchart_run_meta` and journal facts live in `hyperchart_journal`; neither local file is required. Status and the selected UI branch are operational/non-durable; named branch heads are reconstructed from journal mutations. Persisted `status.json` schema v2 contains the runner's current live `branchIds` array (empty at terminal status) (legacy v1 is read for host delivery compatibility and upgraded on the next write). `sessions/progress.json` records `branchId` and producing invocation `seqId`; session directories are branch-separated with no migration of the old layout. Steering requests also carry `branchId`. A user interaction's exact external identity is `(runId, branchId, seqId)`; older two-component identities are rejected.
+The run directory remains the host control-plane root. Without PostgreSQL, `meta.json` and the append-only v2 journal `log.jsonl` are its fundamental durable files. With explicitly configured PostgreSQL storage, run identity lives in `hyperchart_run_meta`, journal facts live in `hyperchart_journal`, and operational runner status lives in `hyperchart_run_status`; none of the three local files is required. Status and the selected UI branch are operational/non-durable; named branch heads are reconstructed from journal mutations. Status is read and patched through the run log store (`readRunStatus`/`patchRunStatus`), so hosts and runners never choose a backend themselves; status writes are allowed from read-access handles because hosts publish `starting`/`stopping` while the live runner holds the journal writer claim. The runner control mailbox follows the same rule: `runner-control/user-responses/` under JSONL, `hyperchart_control` rows under PostgreSQL. Hosts and runners wait for status or control changes through the store (`watchRunChange`): PostgreSQL wakes waiters by `LISTEN/NOTIFY` with a one-second fallback, JSONL re-checks every 100 ms. Persisted `status.json` schema v2 contains the runner's current live `branchIds` array (empty at terminal status) (legacy v1 is read for host delivery compatibility and upgraded on the next write). `sessions/progress.json` records `branchId` and producing invocation `seqId`; session directories are branch-separated with no migration of the old layout. Steering requests also carry `branchId`. A user interaction's exact external identity is `(runId, branchId, seqId)`; older two-component identities are rejected.
 
 Artifact paths keep their authored mutable-file semantics. Branching the durable machine log does not version artifact contents: sibling executions may overwrite the same path, and historical artifact restoration remains a separate artifact-versioning problem.
 
@@ -51,7 +51,7 @@ type HyperchartRunState =
   | "stopped";
 ```
 
-These `status.json` values are different from canonical host run statuses and per-state inspector statuses. See [Pi API](api/pi.md#process-status-values) and [Host API](api/host.md).
+These run status values (`status.json` or `hyperchart_run_status`) are different from canonical host run statuses and per-state inspector statuses. See [Pi API](api/pi.md#process-status-values) and [Host API](api/host.md).
 
 ## Current limitations
 

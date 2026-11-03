@@ -27,7 +27,7 @@ import {
 import { openRunLogStore, parseRunLogStorage, type RunLogStorage } from "../runtime/generic/log_store_factory.js";
 import { supportsSqlTransactions, type SqlCommitParticipant } from "../runtime/generic/postgres_log_store.js";
 import type { RunTerminalState } from "../execution/run_outcome.js";
-import { markRunHeartbeat, patchRunStatus } from "../runtime/generic/run_status.js";
+import { patchRunStatus, type RunStatusPatch } from "../runtime/generic/run_status.js";
 import {
 	archiveTerminalNotificationGeneration,
 	defaultFailedTerminalNotificationPayload,
@@ -366,7 +366,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 				? this.queueBranchMove(request.branchId, request.targetHeadSeqId)
 				: this.respondToUserInteraction(request.branchId, request.gateSeqId, request.event),
 		);
-		this.heartbeat = setInterval(() => markRunHeartbeat(config.runId), 2_000);
+		this.heartbeat = setInterval(() => this.patchStatus({ pid: process.pid, heartbeatAt: Date.now() }), 2_000);
 		this.heartbeat.unref();
 		process.on("SIGTERM", this.onSigterm);
 		process.on("SIGINT", this.onSigint);
@@ -1000,7 +1000,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 				return;
 			}
 			const warnings = gates.flatMap((gate) => gate.warnings);
-			patchRunStatus(this.config.runId, {
+			await this.rootStore.patchRunStatus({
 				chartId: this.ast.id,
 				state: "running",
 				branchIds: [...this.liveBranchIds],
@@ -1481,7 +1481,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 		this.stopLifetimeResources();
 		try {
 			const renderNotification = this.notificationRenderers.get(representative.branchId);
-			persistTerminalNotificationRequest(
+			await persistTerminalNotificationRequest(
 				this.config.runId,
 				renderNotification === undefined
 					? defaultFailedTerminalNotificationPayload({
@@ -1492,7 +1492,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 						})
 					: renderNotification(terminalState, error),
 			);
-			patchRunStatus(this.config.runId, {
+			await this.rootStore.patchRunStatus({
 				chartId: this.ast.id,
 				state: terminalState,
 				branchIds: [],
@@ -1506,7 +1506,9 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 			}
 		} catch (terminalError) {
 			const message = terminalError instanceof Error ? terminalError.message : String(terminalError);
-			patchRunStatus(this.config.runId, { state: "failed", branchIds: [], exitCode: 1, error: message });
+			await this.rootStore
+				.patchRunStatus({ state: "failed", branchIds: [], exitCode: 1, error: message })
+				.catch((statusError: unknown) => console.warn(`Hyperchart status write failed: ${errorMessage(statusError)}`));
 			process.exitCode = 1;
 			state = "failed";
 			error = message;
@@ -1522,11 +1524,18 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 		if (this.phase !== "accepting") {
 			return;
 		}
-		patchRunStatus(this.config.runId, {
+		this.patchStatus({
 			branchIds: [...this.liveBranchIds],
 			pid: process.pid,
 			heartbeatAt: Date.now(),
 		});
+	}
+
+	/** Fire-and-forget status publication for synchronous admission paths; ordering follows call order. */
+	private patchStatus(patch: RunStatusPatch): void {
+		void this.rootStore
+			.patchRunStatus(patch)
+			.catch((error: unknown) => console.warn(`Hyperchart status write failed: ${errorMessage(error)}`));
 	}
 
 	private isRunnable(entry: BranchEntry): boolean {
@@ -1654,7 +1663,7 @@ class HyperchartRunnerControllerImpl implements HyperchartRunnerController {
 			cleanupErrors.length === 0
 				? undefined
 				: `Runner stopped by ${signal}; cleanup failed: ${cleanupErrors.join("; ")}`;
-		patchRunStatus(this.config.runId, {
+		await this.rootStore.patchRunStatus({
 			state: "stopped",
 			branchIds: [],
 			pid: process.pid,
@@ -1719,7 +1728,7 @@ async function prepareRunnerController(
 	const initialBranchIds = runnerBranchIds(config);
 	const attemptId = config.attemptId ?? randomUUID();
 	mkdirSync(join(config.runDir, "sessions"), { recursive: true });
-	patchRunStatus(config.runId, {
+	await patchRunStatus(config.runId, {
 		chartId: config.chartId,
 		state: "starting",
 		branchIds: initialBranchIds,
@@ -1766,7 +1775,7 @@ async function prepareRunnerController(
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		try {
-			persistTerminalNotificationRequest(
+			await persistTerminalNotificationRequest(
 				config.runId,
 				defaultFailedTerminalNotificationPayload({
 					runId: config.runId,
@@ -1778,7 +1787,7 @@ async function prepareRunnerController(
 		} catch (notificationError) {
 			console.error(notificationError);
 		}
-		patchRunStatus(config.runId, {
+		await patchRunStatus(config.runId, {
 			state: "failed",
 			branchIds: [],
 			pid: process.pid,

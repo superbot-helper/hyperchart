@@ -75,7 +75,7 @@ async function createStoppedRun() {
 			createdAt: new Date().toISOString(),
 		}),
 	);
-	withRunStorage(storage, () =>
+	await withRunStorage(storage, () =>
 		patchRunStatus(runId, { branchIds: ["main"], chartId: "quickstart", state: "stopped" }),
 	);
 	const store = new JsonlLogStore(join(runDir, "log.jsonl"));

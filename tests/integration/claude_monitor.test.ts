@@ -49,7 +49,7 @@ function world(layout: RunStorage["layout"] = "run-id") {
 	return { root, runsRoot, cwd, storage };
 }
 
-function createRequest(
+async function createRequest(
 	storage: RunStorage,
 	cwd: string,
 	name: string,
@@ -67,10 +67,10 @@ function createRequest(
 		createdAt: new Date().toISOString(),
 		originSessionId: sessionId,
 	});
-	withRunStorage(storage, () =>
+	await withRunStorage(storage, () =>
 		patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "running", heartbeatAt: Date.now() }),
 	);
-	withRunStorage(storage, () =>
+	await withRunStorage(storage, () =>
 		persistTerminalNotificationRequest(runId, {
 			runId,
 			branchId: "main",
@@ -81,7 +81,7 @@ function createRequest(
 		}),
 	);
 	if (status !== "running") {
-		withRunStorage(storage, () => patchRunStatus(runId, { state: status, heartbeatAt: undefined }));
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: status, heartbeatAt: undefined }));
 	}
 	return runId;
 }
@@ -89,7 +89,7 @@ function createRequest(
 describe("Claude terminal monitor", () => {
 	it("routes by exact session and workDir, writes one physical line, and receipts once", async () => {
 		const { storage, runsRoot, cwd, root } = world();
-		const owned = createRequest(
+		const owned = await createRequest(
 			storage,
 			cwd,
 			"owned",
@@ -97,8 +97,8 @@ describe("Claude terminal monitor", () => {
 			"complete",
 			`dangerous terminal payload ${"x".repeat(100_000)}`,
 		);
-		createRequest(storage, cwd, "foreign-session", "session-b");
-		createRequest(storage, join(root, "other"), "foreign-workdir", "session-a");
+		await createRequest(storage, cwd, "foreign-session", "session-b");
+		await createRequest(storage, join(root, "other"), "foreign-workdir", "session-a");
 		const lines: string[] = [];
 
 		expect(
@@ -107,7 +107,9 @@ describe("Claude terminal monitor", () => {
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: (line) => lines.push(line),
+				writeLine: (line) => {
+					lines.push(line);
+				},
 			}),
 		).toBe(1);
 		expect(lines).toHaveLength(1);
@@ -128,14 +130,16 @@ describe("Claude terminal monitor", () => {
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: (line) => lines.push(line),
+				writeLine: (line) => {
+					lines.push(line);
+				},
 			}),
 		).toBe(0);
 	});
 
 	it("bounds overflow through the actual Claude monitor serializer", async () => {
 		const { storage, runsRoot, cwd } = world("sha256");
-		createRequest(storage, cwd, "x".repeat(100_000), "session-a", "complete", "prompt");
+		await createRequest(storage, cwd, "x".repeat(100_000), "session-a", "complete", "prompt");
 		const lines: string[] = [];
 		expect(
 			await emitPendingClaudeTerminalNotifications({
@@ -143,7 +147,9 @@ describe("Claude terminal monitor", () => {
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: (line) => lines.push(line),
+				writeLine: (line) => {
+					lines.push(line);
+				},
 			}),
 		).toBe(1);
 		expect(Buffer.byteLength(lines[0]!)).toBeLessThanOrEqual(64 * 1024);
@@ -155,7 +161,7 @@ describe("Claude terminal monitor", () => {
 
 	it("recovers a pre-delivery crash after the claim lease expires", async () => {
 		const { storage, runsRoot, cwd } = world();
-		const runId = createRequest(storage, cwd, "crashed-before-write", "session-a");
+		const runId = await createRequest(storage, cwd, "crashed-before-write", "session-a");
 		const request = withRunStorage(storage, () => readTerminalNotificationRequest(runId))!;
 		expect(
 			withRunStorage(storage, () =>
@@ -171,7 +177,9 @@ describe("Claude terminal monitor", () => {
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: (line) => lines.push(line),
+				writeLine: (line) => {
+					lines.push(line);
+				},
 			}),
 		).toBe(1);
 		expect(lines).toHaveLength(1);
@@ -180,17 +188,17 @@ describe("Claude terminal monitor", () => {
 
 	it("does not confirm a replacement generation when delivery races with resume", async () => {
 		const { storage, runsRoot, cwd } = world();
-		const runId = createRequest(storage, cwd, "delivery-race", "session-a");
+		const runId = await createRequest(storage, cwd, "delivery-race", "session-a");
 		await expect(
 			emitPendingClaudeTerminalNotifications({
 				storage,
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: () => {
-					withRunStorage(storage, () => patchRunStatus(runId, { state: "starting" }));
+				writeLine: async () => {
+					await withRunStorage(storage, () => patchRunStatus(runId, { state: "starting" }));
 					withRunStorage(storage, () => archiveTerminalNotificationGeneration(runId));
-					withRunStorage(storage, () =>
+					await withRunStorage(storage, () =>
 						persistTerminalNotificationRequest(runId, {
 							runId: "delivery-race",
 							branchId: "main",
@@ -200,7 +208,7 @@ describe("Claude terminal monitor", () => {
 							artifacts: [],
 						}),
 					);
-					withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
+					await withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
 				},
 			}),
 		).rejects.toThrow(/no longer active/);
@@ -213,7 +221,9 @@ describe("Claude terminal monitor", () => {
 				runsRoot,
 				cwd,
 				sessionId: "session-a",
-				writeLine: (line) => lines.push(line),
+				writeLine: (line) => {
+					lines.push(line);
+				},
 			}),
 		).toBe(1);
 		expect(lines).toHaveLength(1);
@@ -222,7 +232,7 @@ describe("Claude terminal monitor", () => {
 
 	it("leaves a failed stdout write recoverable instead of confirming it", async () => {
 		const { storage, runsRoot, cwd } = world();
-		const runId = createRequest(storage, cwd, "write-failed", "session-a");
+		const runId = await createRequest(storage, cwd, "write-failed", "session-a");
 		await expect(
 			emitPendingClaudeTerminalNotifications({
 				storage,
@@ -239,11 +249,11 @@ describe("Claude terminal monitor", () => {
 
 	it("waits for status/outcome agreement", async () => {
 		const { storage, runsRoot, cwd } = world();
-		const runId = createRequest(storage, cwd, "running", "session-a", "running");
+		const runId = await createRequest(storage, cwd, "running", "session-a", "running");
 		expect(await pendingOwnedClaudeTerminalRequests({ storage, runsRoot, cwd, sessionId: "session-a" })).toEqual([]);
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "failed" }));
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "failed" }));
 		expect(await pendingOwnedClaudeTerminalRequests({ storage, runsRoot, cwd, sessionId: "session-a" })).toEqual([]);
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
 		expect(await pendingOwnedClaudeTerminalRequests({ storage, runsRoot, cwd, sessionId: "session-a" })).toHaveLength(
 			1,
 		);
@@ -253,13 +263,13 @@ describe("Claude terminal monitor", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(100_000);
 		const { storage, runsRoot, cwd } = world();
-		const runId = createRequest(storage, cwd, "request-before-status", "session-a", "running");
-		withRunStorage(storage, () => patchRunStatus(runId, { pid: 999_999_999, heartbeatAt: 1 }));
+		const runId = await createRequest(storage, cwd, "request-before-status", "session-a", "running");
+		await withRunStorage(storage, () => patchRunStatus(runId, { pid: 999_999_999, heartbeatAt: 1 }));
 		const done = withRunStorage(storage, () => watchRun(runId));
 
 		await withRunStorage(storage, () => vi.advanceTimersByTimeAsync(21_000));
 		await expect(done).resolves.toMatchObject({ state: "complete", exitCode: 0 });
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({ state: "complete", exitCode: 0 });
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({ state: "complete", exitCode: 0 });
 	});
 
 	it("keeps scanning for requests created after monitor startup", async () => {
@@ -277,7 +287,7 @@ describe("Claude terminal monitor", () => {
 		});
 		try {
 			await new Promise((resolve) => setTimeout(resolve, 60));
-			const runId = createRequest(storage, cwd, "late", "session-a");
+			const runId = await createRequest(storage, cwd, "late", "session-a");
 			const line = await new Promise<string>((resolve, reject) => {
 				let buffer = "";
 				const timeout = setTimeout(() => reject(new Error("monitor did not emit a notification")), 3_000);

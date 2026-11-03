@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { sanitizeSegment } from "../../core/action_uid.js";
@@ -15,8 +15,6 @@ export async function createRun(chartId: string): Promise<string> {
 }
 
 export async function initializeRun(runId: string): Promise<void> {
-	const { runDir } = resolveRunPaths(runId);
-	mkdirSync(join(runDir, "sessions"), { recursive: true });
 	const store = await openRunLogStore(runId, { access: "writer" });
 	try {
 		await store.initializeRootBranch();
@@ -44,11 +42,9 @@ export async function loadRunMeta(runId: string): Promise<RunMeta> {
 }
 
 export async function saveRunMeta(runId: string, meta: RunMeta): Promise<void> {
-	const { runDir } = resolveRunPaths(runId);
 	if (meta.runId !== undefined && meta.runId !== runId) {
 		throw new Error(`Hyperchart run identity mismatch for '${runId}'`);
 	}
-	mkdirSync(join(runDir, "sessions"), { recursive: true });
 	const store = await openRunLogStore(runId, { access: "writer" });
 	try {
 		await store.writeRunMeta({ ...normalizeRunMeta(meta), runId });

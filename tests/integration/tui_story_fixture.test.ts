@@ -29,7 +29,7 @@ describe("Storybook production TUI fixture", () => {
 		for (const item of fixture.history) {
 			const runDir = resolveRunPaths(item.runId, fixture.storage).runDir;
 			const ast = item.runId === fixture.gateAndEmit.runId ? fixture.gateAndEmit.ast : fixture.ast;
-			const status = withRunStorage(fixture.storage, () => readRunStatus(item.runId));
+			const status = await withRunStorage(fixture.storage, () => readRunStatus(item.runId));
 			expect(status).not.toHaveProperty("runDir");
 			expect(status).toMatchObject({
 				version: 2,

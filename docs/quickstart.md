@@ -124,10 +124,10 @@ The files to know first are:
 |---|---|
 | `meta.json` | Filesystem-backend chart path, working directory, and run identity. PostgreSQL uses `hyperchart_run_meta` instead. |
 | `log.jsonl` | Filesystem-backend semantic journal. PostgreSQL uses `hyperchart_journal` instead. |
-| `status.json` | Operational process status and heartbeat information. |
+| `status.json` | Filesystem-backend operational process status and heartbeat information. PostgreSQL uses `hyperchart_run_status` instead. |
 | `sessions/progress.json` | Optional progress from Pi agent sessions. |
 
-`log.jsonl` is the semantic source of truth. `status.json` and progress are operational overlays.
+`log.jsonl` is the semantic source of truth. Run status and progress are operational overlays.
 
 ## Run a chart with agents
 

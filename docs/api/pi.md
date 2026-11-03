@@ -427,7 +427,7 @@ Moves only the named durable head by appending a branch mutation. All records an
 
 ## Process status values
 
-Pi writes schema-v2 process status with a live `branchIds: string[]` (terminal states use `[]`) to `status.json`:
+Pi writes schema-v2 process status with a live `branchIds: string[]` (terminal states use `[]`) through the run log store: `status.json` under JSONL, the `hyperchart_run_status` row under PostgreSQL:
 
 ```ts
 type HyperchartRunState =

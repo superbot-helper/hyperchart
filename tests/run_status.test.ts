@@ -33,7 +33,7 @@ describe("run status", () => {
 		const runId = "run";
 		const dir = resolveRunPaths(runId, storage).runDir;
 		await mkdir(dir);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, {
 				branchIds: ["main", "experiment"],
 				chartId: "chart",
@@ -44,11 +44,11 @@ describe("run status", () => {
 				heartbeatAt: 100,
 			}),
 		);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, { state: "running", error: undefined, exitCode: undefined, heartbeatAt: Date.now() }),
 		);
 
-		const status = withRunStorage(storage, () => readRunStatus(runId));
+		const status = await withRunStorage(storage, () => readRunStatus(runId));
 		expect(status).toMatchObject({
 			version: 2,
 			runId: "run",
@@ -61,10 +61,12 @@ describe("run status", () => {
 		expect(status?.exitCode).toBeUndefined();
 		expect(isRunLive(status)).toBe(true);
 
-		withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["experiment"] }));
-		expect(withRunStorage(storage, () => readRunStatus(runId))?.branchIds).toEqual(["experiment"]);
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "complete", branchIds: [], attemptId: "attempt-b" }));
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
+		await withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["experiment"] }));
+		expect((await withRunStorage(storage, () => readRunStatus(runId)))?.branchIds).toEqual(["experiment"]);
+		await withRunStorage(storage, () =>
+			patchRunStatus(runId, { state: "complete", branchIds: [], attemptId: "attempt-b" }),
+		);
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 			attemptId: "attempt-b",
@@ -77,12 +79,14 @@ describe("run status", () => {
 		const runId = "run";
 		const dir = resolveRunPaths(runId, storage).runDir;
 		await mkdir(dir);
-		withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }));
+		await withRunStorage(storage, () =>
+			patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }),
+		);
 
-		const heartbeat = withRunStorage(storage, () => markRunHeartbeat(runId));
+		const heartbeat = await withRunStorage(storage, () => markRunHeartbeat(runId));
 
 		expect(heartbeat).toMatchObject({ state: "starting", pid: process.pid, heartbeatAt: expect.any(Number) });
-		expect(withRunStorage(storage, () => readRunStatus(runId))?.state).toBe("starting");
+		expect((await withRunStorage(storage, () => readRunStatus(runId)))?.state).toBe("starting");
 	});
 
 	it("reads legacy singleton status for terminal-notification compatibility", async () => {
@@ -104,7 +108,7 @@ describe("run status", () => {
 				updatedAt: 2,
 			}),
 		);
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
 			version: 2,
 			branchIds: ["main"],
 			state: "complete",

@@ -156,10 +156,9 @@ Fork is different: it creates another named pointer at a historical record, but 
 /hyperchart delete <run-id>
 ```
 
-Deletion removes the selected backend's run identity and journal, then recursively removes the run directory. Under PostgreSQL, `hyperchart_run_meta` and `hyperchart_journal` rows are deleted in one database transaction. Local deletion includes:
+Deletion removes the selected backend's run identity and journal, then recursively removes the run directory. Under PostgreSQL, `hyperchart_run_meta`, `hyperchart_journal`, `hyperchart_run_status`, and `hyperchart_control` rows are deleted in one database transaction. Local deletion includes:
 
-- `meta.json` and `log.jsonl` when using the filesystem backend;
-- `status.json`;
+- `meta.json`, `log.jsonl`, and `status.json` when using the filesystem backend;
 - agent sessions and progress;
 - branch heads and preserved sibling histories in the append-only log;
 - any artifacts stored inside the run directory.

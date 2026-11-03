@@ -45,7 +45,7 @@ export async function getHyperchartBranch(runId: string, branchId: BranchId): Pr
 
 /** Create a durable named pointer without selecting it and without starting a runner. */
 export async function forkHyperchartRun(options: ForkBranchOptions): Promise<ForkBranchResult> {
-	assertStoppedRun(options.runId, "forking");
+	await assertStoppedRun(options.runId, "forking");
 	await assertRunOwnership(options.runId, options.cwd);
 	const meta = await loadRunMeta(options.runId);
 	const parsed = parseChartModuleSync(
@@ -101,8 +101,8 @@ export async function forkHyperchartRun(options: ForkBranchOptions): Promise<For
 	};
 }
 
-export function assertStoppedRun(runId: string, operation: string): void {
-	const status = readRunStatus(runId);
+export async function assertStoppedRun(runId: string, operation: string): Promise<void> {
+	const status = await readRunStatus(runId);
 	if (isRunLive(status)) {
 		throw new Error(`Run '${runId}' is live; stop it before ${operation}`);
 	}

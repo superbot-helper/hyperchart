@@ -1,6 +1,6 @@
 import { dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, open, stat } from "node:fs/promises";
 import {
 	isDurableRecordEntry,
@@ -15,8 +15,27 @@ import {
 import { actionUidKey } from "../../core/action_uid.js";
 import { actorLogicalOccurrencePath } from "../../core/actors.js";
 import type { StatePath } from "../../core/types.js";
+import {
+	applyRunStatusPatch,
+	readRunStatusFile,
+	runStatusFilePath,
+	writeRunStatusFile,
+	type HyperchartRunStatus,
+	type RunStatusPatch,
+} from "./run_status_model.js";
+import {
+	parseControlRequest,
+	parseControlResult,
+	type RunChangeTopic,
+	type RunChangeWait,
+	type RunnerControlRequest,
+	type RunnerControlResult,
+	type WaitForRunChangeOptions,
+} from "./runner_control_model.js";
 
 export const DEFAULT_BRANCH_ID: BranchId = "main";
+/** Interval between JSONL change re-checks; see JsonlLogStore.watchRunChange. */
+export const JSONL_CHANGE_FALLBACK_MS = 100;
 export const HISTORY_READ_ITEMS = 100;
 const REPLAY_PAGE_RECORDS = 500;
 
@@ -740,6 +759,34 @@ export interface RunLogStore extends LogStore, CheckpointRepository {
 	forBranch(branchId: BranchId): RunLogStore;
 	readRunMeta(): Promise<RunMeta | undefined>;
 	writeRunMeta(meta: RunMeta): Promise<void>;
+	/** Operational runner status; never part of durable history. */
+	readRunStatus(): Promise<HyperchartRunStatus | undefined>;
+	/**
+	 * Atomic read-merge-write of the operational status. Allowed from read-access
+	 * handles too: hosts publish starting/stopping while the live runner holds the
+	 * journal writer claim, so status is deliberately outside that claim.
+	 */
+	patchRunStatus(patch: RunStatusPatch): Promise<HyperchartRunStatus>;
+	/**
+	 * Runner control mailbox: attempt-fenced commands from hosts to the live runtime
+	 * and its acknowledgements. Transport only; journal facts stay authoritative.
+	 * Publishing is exclusive by id: a second publish of the same id is rejected for
+	 * requests and reports `false` for results, so an acknowledgement is never replaced.
+	 */
+	publishControlRequest(request: RunnerControlRequest): Promise<void>;
+	/** Pending requests in publication order. Malformed entries are dropped. */
+	listControlRequests(): Promise<readonly RunnerControlRequest[]>;
+	discardControlRequest(requestId: string): Promise<void>;
+	publishControlResult(result: RunnerControlResult): Promise<boolean>;
+	readControlResult(requestId: string): Promise<RunnerControlResult | undefined>;
+	discardControlResult(requestId: string): Promise<void>;
+	/**
+	 * Arm a wait for an operational fact of one of the topics to change, bounded by
+	 * the fallback timeout. Wake-ups are hints: callers always re-read state. Arm it
+	 * before reading, so a change during the read is not lost.
+	 */
+	watchRunChange(topics: readonly RunChangeTopic[], options: WaitForRunChangeOptions): RunChangeWait;
+	/** Remove run identity, journal, operational status, and the control mailbox. */
 	deleteRunData(): Promise<void>;
 	initializeRootBranch(metadata?: BranchMetadata, options?: BranchMutationOptions): Promise<BranchHead>;
 	createBranch(
@@ -750,6 +797,35 @@ export interface RunLogStore extends LogStore, CheckpointRepository {
 	): Promise<BranchHead>;
 	moveBranch(branchId: BranchId, headSeqId: number | null, options?: BranchMutationOptions): Promise<BranchMoveResult>;
 	close(): Promise<void>;
+}
+
+/** Exclusive-create publication: a temp file renamed over a path that must not exist yet. */
+function publishJsonExclusive(path: string, value: unknown): void {
+	mkdirSync(dirname(path), { recursive: true });
+	if (existsSync(path)) {
+		const error = new Error(`Control entry already exists: ${path}`) as NodeJS.ErrnoException;
+		error.code = "EEXIST";
+		throw error;
+	}
+	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+	try {
+		renameSync(temporary, path);
+	} catch (error) {
+		rmSync(temporary, { force: true });
+		throw error;
+	}
+}
+
+function readJsonIfPresent(path: string): unknown {
+	if (!existsSync(path)) {
+		return undefined;
+	}
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as unknown;
+	} catch {
+		return undefined;
+	}
 }
 
 /** @internal Stamp drafts against the file/memory writer's materialized index. */
@@ -810,6 +886,8 @@ export class JsonlLogStore implements RunLogStore {
 	constructor(
 		readonly filePath: string,
 		readonly branchId: BranchId = DEFAULT_BRANCH_ID,
+		/** Storage key; required only for operational status, whose persisted runId is verified. */
+		private readonly runId?: string,
 	) {
 		requireBranchId(branchId, "selected branch");
 		this.journal = newJournal(filePath);
@@ -818,7 +896,7 @@ export class JsonlLogStore implements RunLogStore {
 
 	/** Create another branch handle over this store's already-open incremental journal. */
 	forBranch(branchId: BranchId): JsonlLogStore {
-		const store = new JsonlLogStore(this.journal.filePath, branchId);
+		const store = new JsonlLogStore(this.journal.filePath, branchId, this.runId);
 		store.journal = this.journal;
 		store.registerReplayReader();
 		return store;
@@ -1084,9 +1162,121 @@ export class JsonlLogStore implements RunLogStore {
 		mkdirSync(dirname(this.journal.filePath), { recursive: true });
 		writeFileSync(join(dirname(this.journal.filePath), "meta.json"), `${JSON.stringify(meta, null, 2)}\n`, "utf8");
 	}
+	async readRunStatus(): Promise<HyperchartRunStatus | undefined> {
+		return readRunStatusFile(this.statusPath(), this.requireRunId());
+	}
+	async patchRunStatus(patch: RunStatusPatch): Promise<HyperchartRunStatus> {
+		const runId = this.requireRunId();
+		const path = this.statusPath();
+		const next = applyRunStatusPatch(runId, readRunStatusFile(path, runId), patch);
+		mkdirSync(dirname(path), { recursive: true });
+		writeRunStatusFile(path, next);
+		return next;
+	}
+	async publishControlRequest(request: RunnerControlRequest): Promise<void> {
+		publishJsonExclusive(this.controlPath("requests", request.id), request);
+	}
+	async listControlRequests(): Promise<readonly RunnerControlRequest[]> {
+		let files: string[];
+		try {
+			files = readdirSync(join(this.controlDir(), "requests"))
+				.filter((file) => file.endsWith(".json"))
+				.sort();
+		} catch {
+			return [];
+		}
+		const requests: RunnerControlRequest[] = [];
+		for (const file of files) {
+			const path = join(this.controlDir(), "requests", file);
+			const request = parseControlRequest(readJsonIfPresent(path));
+			if (request === undefined) {
+				// Unreadable or malformed requests can never be acknowledged; drop them.
+				rmSync(path, { force: true });
+				continue;
+			}
+			requests.push(request);
+		}
+		return requests.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+	}
+	async discardControlRequest(requestId: string): Promise<void> {
+		rmSync(this.controlPath("requests", requestId), { force: true });
+	}
+	async publishControlResult(result: RunnerControlResult): Promise<boolean> {
+		try {
+			publishJsonExclusive(this.controlPath("results", result.requestId), result);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+				return false;
+			}
+			throw error;
+		}
+	}
+	async readControlResult(requestId: string): Promise<RunnerControlResult | undefined> {
+		return parseControlResult(readJsonIfPresent(this.controlPath("results", requestId)));
+	}
+	async discardControlResult(requestId: string): Promise<void> {
+		rmSync(this.controlPath("results", requestId), { force: true });
+	}
+	/**
+	 * JSONL has no change signal worth trusting: macOS FSEvents can lag by seconds
+	 * under load and would make waits nondeterministic, while a local re-read is a
+	 * cheap readdir or stat. The wait is therefore a short timer; the caller's
+	 * timeout only caps it. Topics are accepted for interface parity.
+	 */
+	watchRunChange(_topics: readonly RunChangeTopic[], options: WaitForRunChangeOptions): RunChangeWait {
+		let cancel: () => void = () => {};
+		const changed = new Promise<void>((resolve, reject) => {
+			if (options.signal?.aborted) {
+				reject(options.signal.reason);
+				return;
+			}
+			const finish = () => {
+				clearTimeout(timer);
+				options.signal?.removeEventListener("abort", onAbort);
+			};
+			const onAbort = () => {
+				finish();
+				reject(options.signal?.reason);
+			};
+			const timer = setTimeout(
+				() => {
+					finish();
+					resolve();
+				},
+				Math.min(options.timeoutMs, JSONL_CHANGE_FALLBACK_MS),
+			);
+			if (options.persistent !== true) {
+				timer.unref();
+			}
+			cancel = () => {
+				finish();
+				resolve();
+			};
+			options.signal?.addEventListener("abort", onAbort, { once: true });
+		});
+		return { changed, cancel: () => cancel() };
+	}
 	async deleteRunData(): Promise<void> {
 		rmSync(join(dirname(this.journal.filePath), "meta.json"), { force: true });
+		rmSync(this.statusPath(), { force: true });
+		rmSync(this.controlDir(), { recursive: true, force: true });
 		rmSync(this.journal.filePath, { force: true });
+	}
+	private statusPath(): string {
+		return runStatusFilePath(dirname(this.journal.filePath));
+	}
+	private controlDir(): string {
+		return join(dirname(this.journal.filePath), "runner-control", "user-responses");
+	}
+	private controlPath(role: "requests" | "results", id: string): string {
+		return join(this.controlDir(), role, `${id}.json`);
+	}
+	private requireRunId(): string {
+		if (this.runId === undefined) {
+			throw new Error("JSONL run status requires the store to be opened with a run identity");
+		}
+		return this.runId;
 	}
 	async createBranch(
 		branchId: BranchId,

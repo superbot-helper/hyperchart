@@ -20,7 +20,7 @@ export async function openRunLogStore(runId: string, options: OpenRunLogStoreOpt
 	const branchId = options.branchId ?? DEFAULT_BRANCH_ID;
 	switch (storage.kind) {
 		case "jsonl":
-			return new JsonlLogStore(`${runDir}/log.jsonl`, branchId);
+			return new JsonlLogStore(`${runDir}/log.jsonl`, branchId, runId);
 		case "postgres":
 			return PostgresLogStore.open({
 				dsn: storage.dsn,

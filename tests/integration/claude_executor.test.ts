@@ -529,7 +529,7 @@ export default chart({ kind: "chart", id: "simple", initial: "done", states: { d
 			process.chdir(previousCwd);
 		}
 		const { readRunStatus } = await import("../../packages/hyperchart/src/runtime/generic/run_status.js");
-		const status = withRunStorage(storage, () => readRunStatus(runId));
+		const status = await withRunStorage(storage, () => readRunStatus(runId));
 		expect(status?.state).toBe("complete");
 		expect(readdirSync(runDir)).toContain("sessions");
 	});

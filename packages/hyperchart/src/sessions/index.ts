@@ -27,6 +27,5 @@ export {
 	patchRunStatus,
 	readRunStatus,
 	runStatusPath,
-	writeRunStatus,
 } from "../runtime/generic/run_status.js";
-export type { HyperchartRunState, HyperchartRunStatus } from "../runtime/generic/run_status.js";
+export type { HyperchartRunState, HyperchartRunStatus, RunStatusPatch } from "../runtime/generic/run_status.js";

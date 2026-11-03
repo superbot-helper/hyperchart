@@ -33,7 +33,7 @@ describe("hyperchart runner replay warning policy", () => {
 
 		await main([paths.configPath]);
 
-		const status = withRunStorage(paths.storage, () => readRunStatus(paths.runId));
+		const status = await withRunStorage(paths.storage, () => readRunStatus(paths.runId));
 		expect(status).toMatchObject({ state: "failed", exitCode: 1 });
 		expect(status?.error).toContain("Replay over the current chart produced warning-level compatibility issues");
 		expect(status?.error).toContain("stale provenance");
@@ -45,7 +45,7 @@ describe("hyperchart runner replay warning policy", () => {
 
 		await main([paths.configPath]);
 
-		const status = withRunStorage(paths.storage, () => readRunStatus(paths.runId));
+		const status = await withRunStorage(paths.storage, () => readRunStatus(paths.runId));
 		expect(status).toMatchObject({ state: "complete", exitCode: 0 });
 		expect(status?.replayWarnings?.join("\n")).toContain("stale provenance");
 		expect(process.exitCode).toBeUndefined();

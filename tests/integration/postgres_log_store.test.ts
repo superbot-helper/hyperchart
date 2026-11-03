@@ -34,7 +34,13 @@ import {
 	readPostgresJournalPage,
 	CHECKPOINT_TABLE,
 	RUN_META_TABLE,
+	RUN_STATUS_TABLE,
+	CONTROL_TABLE,
 } from "../../packages/hyperchart/src/runtime/generic/postgres_log_store.js";
+import {
+	CONTROL_VERSION,
+	type RunnerControlRequest,
+} from "../../packages/hyperchart/src/runtime/generic/runner_control_model.js";
 import { openRunLogStore } from "../../packages/hyperchart/src/runtime/generic/log_store_factory.js";
 import {
 	deleteRunStorage,
@@ -42,7 +48,7 @@ import {
 	loadRunMeta,
 	saveRunMeta,
 } from "../../packages/hyperchart/src/runtime/generic/run_dir.js";
-import { patchRunStatus } from "../../packages/hyperchart/src/runtime/generic/run_status.js";
+import { patchRunStatus, readRunStatus } from "../../packages/hyperchart/src/runtime/generic/run_status.js";
 import { createPiHyperchartHost } from "../../packages/pi-hyperchart/src/runtime/pi/host_adapter.js";
 import {
 	loadBranchProjection,
@@ -215,11 +221,123 @@ afterAll(async () => {
 	await client.query(`DELETE FROM ${CHECKPOINT_TABLE} WHERE run_id = ANY($1)`, [usedRunIds]).catch(() => {});
 	await client.query(`DELETE FROM ${JOURNAL_TABLE} WHERE run_id = ANY($1)`, [usedRunIds]).catch(() => {});
 	await client.query(`DELETE FROM ${RUN_META_TABLE} WHERE run_id = ANY($1)`, [usedRunIds]).catch(() => {});
+	await client.query(`DELETE FROM ${RUN_STATUS_TABLE} WHERE run_id = ANY($1)`, [usedRunIds]).catch(() => {});
+	await client.query(`DELETE FROM ${CONTROL_TABLE} WHERE run_id = ANY($1)`, [usedRunIds]).catch(() => {});
 	await client.query("DELETE FROM hyperchart_test_claims WHERE run_id = ANY($1)", [usedRunIds]).catch(() => {});
 	await client.end();
 });
 
 describePg("PostgresLogStore", () => {
+	it("carries runner control through hyperchart_control and wakes waiters by NOTIFY", async () => {
+		const runId = newRunId();
+		const host = await openReader(runId);
+		const runner = await openReader(runId);
+		const request: RunnerControlRequest = {
+			version: CONTROL_VERSION,
+			kind: "move_branch",
+			id: "req-1",
+			attemptId: "attempt-a",
+			branchId: "main",
+			targetHeadSeqId: null,
+			createdAt: 1,
+		};
+		// The runner parks on a long fallback; only the NOTIFY from the host's publish can wake it early.
+		const runnerWoken = runner.watchRunChange(["control"], { timeoutMs: 20_000 }).changed.then(() => Date.now());
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const published = Date.now();
+		await host.publishControlRequest(request);
+		expect((await runnerWoken) - published).toBeLessThan(5_000);
+		await expect(host.publishControlRequest(request)).rejects.toThrow(/already exists/);
+		expect(await runner.listControlRequests()).toEqual([request]);
+
+		const hostWoken = host.watchRunChange(["control", "status"], { timeoutMs: 20_000 }).changed.then(() => Date.now());
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const result = {
+			version: CONTROL_VERSION,
+			kind: "move_branch",
+			requestId: "req-1",
+			attemptId: "attempt-a",
+			ok: true,
+			moveSeqId: 3,
+			previousHeadSeqId: 2,
+			preservedRecords: 1,
+			completedAt: 2,
+		} as const;
+		const resultPublished = Date.now();
+		expect(await runner.publishControlResult(result)).toBe(true);
+		expect(await runner.publishControlResult({ ...result, moveSeqId: 9 })).toBe(false);
+		expect((await hostWoken) - resultPublished).toBeLessThan(5_000);
+		expect(await host.readControlResult("req-1")).toMatchObject({ ok: true, moveSeqId: 3 });
+
+		const statusWoken = host.watchRunChange(["status"], { timeoutMs: 20_000 }).changed.then(() => Date.now());
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const patched = Date.now();
+		await runner.patchRunStatus({ chartId: "chart", state: "running", branchIds: ["main"] });
+		expect((await statusWoken) - patched).toBeLessThan(5_000);
+
+		await runner.discardControlRequest("req-1");
+		await host.discardControlResult("req-1");
+		expect(await runner.listControlRequests()).toEqual([]);
+		expect(await host.readControlResult("req-1")).toBeUndefined();
+	});
+
+	it("keeps operational run status in hyperchart_run_status outside the writer claim", async () => {
+		const runId = newRunId();
+		const storage: RunStorage = { kind: "postgres", dsn: dsn as string, rootDir: tmpdir(), layout: "sha256" };
+		const runDir = resolveRunPaths(runId, storage).runDir;
+		// A host publishes "starting" through a read handle before any writer touched this run.
+		const reader = await openReader(runId);
+		expect(await reader.readRunStatus()).toBeUndefined();
+		const starting = await reader.patchRunStatus({
+			chartId: "status-chart",
+			state: "starting",
+			branchIds: ["main"],
+			attemptId: "attempt-a",
+			heartbeatAt: 100,
+		});
+		expect(starting).toMatchObject({ version: 2, runId, state: "starting", attemptId: "attempt-a" });
+
+		// The live writer holds the journal claim; the host still patches status concurrently.
+		const writer = await openWriter(runId);
+		await writer.initializeRootBranch();
+		await writer.patchRunStatus({ state: "running", pid: process.pid, heartbeatAt: Date.now() });
+		await reader.patchRunStatus({ state: "stopping" });
+		const stopping = await withRunStorage(storage, () => readRunStatus(runId));
+		expect(stopping).toMatchObject({
+			state: "stopping",
+			chartId: "status-chart",
+			branchIds: ["main"],
+			attemptId: "attempt-a",
+			pid: process.pid,
+			startedAt: starting.startedAt,
+		});
+
+		// A key present in the patch wins even when undefined; replay warnings round-trip as JSON.
+		await writer.patchRunStatus({
+			state: "failed",
+			branchIds: [],
+			pid: undefined,
+			heartbeatAt: undefined,
+			exitCode: 1,
+			error: "boom",
+			replayWarnings: ["stale"],
+		});
+		const failed = await reader.readRunStatus();
+		expect(failed).toMatchObject({
+			state: "failed",
+			branchIds: [],
+			exitCode: 1,
+			error: "boom",
+			replayWarnings: ["stale"],
+		});
+		expect(failed?.pid).toBeUndefined();
+		expect(failed?.heartbeatAt).toBeUndefined();
+		expect(existsSync(join(runDir, "status.json"))).toBe(false);
+
+		await writer.deleteRunData();
+		expect(await reader.readRunStatus()).toBeUndefined();
+	});
+
 	it("pages the physical journal across branches and retains moves", async () => {
 		const runId = newRunId();
 		const store = await openWriter(runId);
@@ -316,7 +434,7 @@ describePg("PostgresLogStore", () => {
 					originSessionId: "session-host",
 				}),
 			);
-			withRunStorage(storage, () =>
+			await withRunStorage(storage, () =>
 				patchRunStatus(runId, { chartId: "postgres-meta-host", state: "stopped", branchIds: ["main"] }),
 			);
 			expect(existsSync(join(runDir, "meta.json"))).toBe(false);

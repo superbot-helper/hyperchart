@@ -357,7 +357,7 @@ export async function validateAndPersistUserInteractionResponse(
 	if (options.owner !== undefined) {
 		await assertUserInteractionOwner(options.owner, options.runId);
 	}
-	const status = readRunStatus(options.runId);
+	const status = await readRunStatus(options.runId);
 	if (isRunLive(status)) {
 		if (status?.attemptId === undefined) {
 			throw new Error(`Live run '${options.runId}' has no runner attempt identity`);
@@ -376,7 +376,7 @@ export async function validateAndPersistUserInteractionResponse(
 		} catch (error) {
 			// A runner may die after the liveness check. Only then may this API become the
 			// temporary sole writer and retry the same idempotent journal operation offline.
-			if (!(error instanceof RunnerControlUnavailableError) || isRunLive(readRunStatus(options.runId))) {
+			if (!(error instanceof RunnerControlUnavailableError) || isRunLive(await readRunStatus(options.runId))) {
 				throw error;
 			}
 		}

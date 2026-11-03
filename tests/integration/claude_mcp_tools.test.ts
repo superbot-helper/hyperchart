@@ -592,7 +592,7 @@ export default chart({
 		await withRunStorage(storage, () =>
 			saveRunMeta(runId, { chartPath, workDir: cwd, chartId: "simple", createdAt: new Date().toISOString() }),
 		);
-		withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["main"], chartId: "simple", state: "running" }));
+		await withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["main"], chartId: "simple", state: "running" }));
 
 		const stopped = JSON.parse(text(await tools.get("hyperchart_stop")!.handler({ runId: "stop-run" })));
 		expect(stopped.stopped).toHaveLength(1);

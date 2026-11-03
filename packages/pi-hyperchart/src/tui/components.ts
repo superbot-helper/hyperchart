@@ -1,6 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveRunPaths, openRunLogStore, withRunStorage, type RunStorage } from "@surprisal/hyperchart/runtime";
-import { readRunStatus } from "@surprisal/hyperchart/sessions";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { getSelectListTheme, type Theme } from "@earendil-works/pi-coding-agent";
@@ -247,21 +246,18 @@ export class RunWidget implements Component {
 		const progressPath = sessionProgressPath(
 			resolve(resolveRunPaths(this.opts.runId, this.opts.storage).runDir, "sessions"),
 		);
-		const status =
-			this.opts.storage === undefined
-				? readRunStatus(this.opts.runId)
-				: withRunStorage(this.opts.storage, () => readRunStatus(this.opts.runId));
-		const stat = `${status?.updatedAt ?? 0}:${statKeyFor(progressPath)}`;
-		if (stat === this.lastStat && this.view !== undefined) {
-			return;
-		}
-		this.lastStat = stat;
 		const branchId = this.opts.branchId ?? "main";
 		const store = await openRunLogStore(this.opts.runId, {
 			branchId,
 			...(this.opts.storage === undefined ? {} : { storage: this.opts.storage }),
 		});
 		try {
+			const status = await store.readRunStatus();
+			const stat = `${status?.updatedAt ?? 0}:${statKeyFor(progressPath)}`;
+			if (stat === this.lastStat && this.view !== undefined) {
+				return;
+			}
+			this.lastStat = stat;
 			const snapshot = await store.captureSnapshot(branchId);
 			const [execution, recordChunk, branches, recordCount] = await Promise.all([
 				readBranchExecutionOverview(this.opts.ast, branchId, store, snapshot),

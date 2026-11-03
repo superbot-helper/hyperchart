@@ -55,6 +55,7 @@ import {
 	queueLiveSessionSteering,
 	readRunStatus,
 	readSessionProgress,
+	type HyperchartRunStatus,
 } from "@surprisal/hyperchart/sessions";
 import { claudeHostPaths, claudeRunsRoot, claudeUserChartsDir } from "../claude/paths.js";
 import { createClaudeAgentDefaultsResolver } from "../claude/agent_definitions.js";
@@ -145,7 +146,7 @@ export function createHyperchartMcpTools(deps: HyperchartMcpDeps): HyperchartMcp
 				const allRunIds = await runIdsFor(runsRoot(), cwd);
 				const runs = await Promise.all(
 					allRunIds.slice(0, 20).map(async (runId) => {
-						const status = readRunStatus(runId);
+						const status = await readRunStatus(runId);
 						const meta = await loadRunMeta(runId);
 						return {
 							runId: truncateToolText(runId),
@@ -278,9 +279,8 @@ export function createHyperchartMcpTools(deps: HyperchartMcpDeps): HyperchartMcp
 						...(deps.sessionId === undefined ? {} : { originSessionId: deps.sessionId }),
 					});
 				}
-				mkdirSync(resolve(resolveRunPaths(runId).runDir, "sessions"), { recursive: true });
 				assertRunId(runId);
-				const existingStatus = readRunStatus(runId);
+				const existingStatus = await readRunStatus(runId);
 				if (isRunLive(existingStatus)) {
 					if (args.wait === true) {
 						const boundary = await watchClaudeRunBoundary(runId, interactionOwner(cwd));
@@ -297,7 +297,7 @@ export function createHyperchartMcpTools(deps: HyperchartMcpDeps): HyperchartMcp
 				}
 
 				const attemptId = randomUUID();
-				patchRunStatus(runId, {
+				await patchRunStatus(runId, {
 					chartId: parsed.ast.id,
 					state: "starting",
 					branchIds,
@@ -333,7 +333,7 @@ export function createHyperchartMcpTools(deps: HyperchartMcpDeps): HyperchartMcp
 				};
 				const pid = spawnDetachedRunner(config);
 				// The child runner alone promotes starting -> running after every replay gate passes.
-				patchRunStatus(runId, { chartId: parsed.ast.id, branchIds, pid, heartbeatAt: Date.now() });
+				await patchRunStatus(runId, { chartId: parsed.ast.id, branchIds, pid, heartbeatAt: Date.now() });
 				if (args.wait === true) {
 					const boundary = await watchClaudeRunBoundary(runId, interactionOwner(cwd));
 					if (boundary.kind === "user") {
@@ -766,12 +766,12 @@ function waitedUserInteractionResult(
 	});
 }
 
-function waitedRunResult(
+async function waitedRunResult(
 	runId: string,
 	meta: RunMeta,
 	sessionId: string | undefined,
 	value: Record<string, unknown>,
-): ToolResult {
+): Promise<ToolResult> {
 	if (sessionId === undefined) {
 		return ok({
 			...value,
@@ -790,7 +790,7 @@ function waitedRunResult(
 				"This run is not owned by the current Claude session; its terminal notification was not receipted here.",
 		});
 	}
-	const request = readDeliverableTerminalNotificationRequest(runId);
+	const request = await readDeliverableTerminalNotificationRequest(runId);
 	if (request === undefined) {
 		return ok({ ...value, boundary: "terminal", final: true });
 	}
@@ -811,7 +811,7 @@ function waitedRunResult(
 	});
 }
 
-function compactRunStatus(status: ReturnType<typeof readRunStatus>) {
+function compactRunStatus(status: HyperchartRunStatus | undefined) {
 	if (status === undefined) {
 		return { state: "unknown" as const };
 	}
@@ -902,10 +902,15 @@ async function runIdsFor(root: string, cwd: string): Promise<string[]> {
 }
 
 async function activeRunIdsForWorkDir(root: string, cwd: string): Promise<string[]> {
-	return (await runIdsFor(root, cwd)).filter((runId) => {
-		const status = readRunStatus(runId);
-		return status !== undefined && (isRunLive(status) || ["starting", "running", "stopping"].includes(status.state));
-	});
+	const candidates = await Promise.all(
+		(await runIdsFor(root, cwd)).map(async (runId) => ({ runId, status: await readRunStatus(runId) })),
+	);
+	return candidates
+		.filter(
+			({ status }) =>
+				status !== undefined && (isRunLive(status) || ["starting", "running", "stopping"].includes(status.state)),
+		)
+		.map(({ runId }) => runId);
 }
 
 async function stopRun(runId: string, cwd: string): Promise<{ runId: string; pid?: number }> {
@@ -913,11 +918,11 @@ async function stopRun(runId: string, cwd: string): Promise<{ runId: string; pid
 	if (resolve(meta.workDir) !== resolve(cwd)) {
 		throw new Error(`Run '${runId}' belongs to ${meta.workDir}; run from that directory`);
 	}
-	const status = readRunStatus(runId);
-	patchRunStatus(runId, { state: "stopping" });
+	const status = await readRunStatus(runId);
+	await patchRunStatus(runId, { state: "stopping" });
 	const pid = status?.pid !== undefined && isPidAlive(status.pid) ? status.pid : undefined;
 	if (pid === undefined) {
-		patchRunStatus(runId, { state: "stopped", exitCode: 0, error: "runner was not live" });
+		await patchRunStatus(runId, { state: "stopped", exitCode: 0, error: "runner was not live" });
 	} else {
 		process.kill(pid, "SIGTERM");
 	}

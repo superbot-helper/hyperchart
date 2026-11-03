@@ -74,8 +74,8 @@ it("Claude monitor uses explicit runsRoot under conflicting ambient storage and 
 				originSessionId: "session",
 				createdAt: new Date().toISOString(),
 			});
-			patchRunStatus(runId, { chartId: "chart", branchIds: ["main"], state: "running" });
-			persistTerminalNotificationRequest(runId, {
+			await patchRunStatus(runId, { chartId: "chart", branchIds: ["main"], state: "running" });
+			await persistTerminalNotificationRequest(runId, {
 				runId,
 				branchId: "main",
 				chartId: "chart",
@@ -83,7 +83,7 @@ it("Claude monitor uses explicit runsRoot under conflicting ambient storage and 
 				prompt: storage.rootDir,
 				artifacts: [],
 			});
-			patchRunStatus(runId, { state: "complete" });
+			await patchRunStatus(runId, { state: "complete" });
 		});
 	}
 	const lines: string[] = [];
@@ -91,7 +91,9 @@ it("Claude monitor uses explicit runsRoot under conflicting ambient storage and 
 		runsRoot: a.rootDir,
 		cwd: home,
 		sessionId: "session",
-		writeLine: (line: string) => lines.push(line),
+		writeLine: (line: string) => {
+			lines.push(line);
+		},
 	};
 	const aRequest = (await monitor.pendingOwnedClaudeTerminalRequests(options))[0]!;
 	await withRunStorage(b, async () => {

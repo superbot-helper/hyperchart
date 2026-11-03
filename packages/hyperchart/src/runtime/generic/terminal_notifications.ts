@@ -63,13 +63,15 @@ export function defaultFailedTerminalNotificationPayload(input: {
 	};
 }
 
-/** A request becomes deliverable only after status.json records the same terminal outcome. */
-export function readDeliverableTerminalNotificationRequest(runId: string): TerminalNotificationRequest | undefined {
+/** A request becomes deliverable only after the run status records the same terminal outcome. */
+export async function readDeliverableTerminalNotificationRequest(
+	runId: string,
+): Promise<TerminalNotificationRequest | undefined> {
 	const request = readTerminalNotificationRequest(runId);
 	if (request === undefined) {
 		return undefined;
 	}
-	const status = readRunStatus(runId);
+	const status = await readRunStatus(runId);
 	if (status?.state !== request.payload.outcome) {
 		return undefined;
 	}
@@ -92,11 +94,11 @@ export function readDeliverableTerminalNotificationRequest(runId: string): Termi
  * Repair a runner that died before publishing terminal status. If the outbox was
  * already written, its outcome wins; otherwise persist a failed request first.
  */
-export function recoverStaleRunTerminalNotification(
+export async function recoverStaleRunTerminalNotification(
 	runId: string,
 	now = Date.now(),
-): TerminalNotificationRequest | undefined {
-	const status = readRunStatus(runId);
+): Promise<TerminalNotificationRequest | undefined> {
+	const status = await readRunStatus(runId);
 	if (status === undefined || (status.state !== "starting" && status.state !== "running") || isRunLive(status, now)) {
 		return undefined;
 	}
@@ -112,7 +114,7 @@ export function recoverStaleRunTerminalNotification(
 			archiveTerminalNotificationGeneration(runId);
 		}
 		const error = status.error ?? "runner exited before recording a terminal status";
-		request = persistTerminalNotificationRequest(
+		request = await persistTerminalNotificationRequest(
 			runId,
 			defaultFailedTerminalNotificationPayload({
 				runId: status.runId,
@@ -125,7 +127,7 @@ export function recoverStaleRunTerminalNotification(
 	if (request === undefined) {
 		throw new Error(`Failed to recover terminal notification request for ${runId}`);
 	}
-	patchRunStatus(runId, {
+	await patchRunStatus(runId, {
 		state: request.payload.outcome,
 		branchIds: [],
 		pid: undefined,
@@ -159,10 +161,10 @@ export function archiveTerminalNotificationGeneration(runId: string): string | u
 }
 
 /** Persist-once outbox write. Existing identical payloads are reused; divergent terminal replay fails loud. */
-export function persistTerminalNotificationRequest(
+export async function persistTerminalNotificationRequest(
 	runId: string,
 	payload: TerminalNotificationPayload,
-): TerminalNotificationRequest {
+): Promise<TerminalNotificationRequest> {
 	const path = terminalNotificationRequestPath(runId);
 	const existing = readTerminalNotificationRequest(runId);
 	if (existing !== undefined) {
@@ -172,7 +174,7 @@ export function persistTerminalNotificationRequest(
 		return existing;
 	}
 	mkdirSync(join(resolveRunPaths(runId).runDir, TERMINAL_NOTIFICATION_DIR), { recursive: true });
-	const attemptId = readRunStatus(runId)?.attemptId;
+	const attemptId = (await readRunStatus(runId))?.attemptId;
 	const request: TerminalNotificationRequest = {
 		version: 2,
 		// Identity belongs to this outbox generation, not its payload. Rewind removes the

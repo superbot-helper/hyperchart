@@ -6,7 +6,6 @@ import {
 	chmodSync,
 	closeSync,
 	existsSync,
-	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
@@ -54,6 +53,7 @@ import {
 	withRunLogStorage,
 	type RunLogStorage,
 	type RunMeta,
+	type RunLogStore,
 } from "@surprisal/hyperchart/runtime";
 import {
 	USER_INTERACTION_WAIT_LEASE_MS,
@@ -1950,9 +1950,8 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 			originSessionId: ctx.sessionManager.getSessionId(),
 		});
 	}
-	mkdirSync(resolve(resolveRunPaths(actualRunId).runDir, "sessions"), { recursive: true });
 	const runId = actualRunId;
-	const existingStatus = readRunStatus(actualRunId);
+	const existingStatus = await readRunStatus(actualRunId);
 	if (isRunLive(existingStatus)) {
 		const done = watchRun(actualRunId);
 		const active: ActiveRun = {
@@ -1991,7 +1990,7 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 	}
 
 	const attemptId = randomUUID();
-	patchRunStatus(actualRunId, {
+	await patchRunStatus(actualRunId, {
 		chartId: parsed.ast.id,
 		state: "starting",
 		branchIds,
@@ -2032,9 +2031,9 @@ async function startHyperchartRun(opts: RunStartOptions, ctx: HyperchartContext)
 	};
 	const pid = spawnRunner(config);
 	// The child runner alone promotes starting -> running after every replay gate passes.
-	patchRunStatus(actualRunId, { chartId: parsed.ast.id, branchIds, pid, heartbeatAt: Date.now() });
+	await patchRunStatus(actualRunId, { chartId: parsed.ast.id, branchIds, pid, heartbeatAt: Date.now() });
 	const done = watchRun(actualRunId);
-	const status = readRunStatus(actualRunId);
+	const status = await readRunStatus(actualRunId);
 	const active: ActiveRun = {
 		runId,
 		ast: parsed.ast,
@@ -2096,8 +2095,8 @@ async function deliverPendingPiTerminalNotification(
 	if ((await activePiUserInteraction(ctx)) !== undefined) {
 		return false;
 	}
-	recoverStaleRunTerminalNotification(runId);
-	const request = readDeliverableTerminalNotificationRequest(runId);
+	await recoverStaleRunTerminalNotification(runId);
+	const request = await readDeliverableTerminalNotificationRequest(runId);
 	if (request === undefined) {
 		return false;
 	}
@@ -2113,7 +2112,7 @@ async function deliverPendingPiTerminalNotification(
 	if (!claimTerminalNotificationReceipt(runId, request.requestId, "pi", sessionId)) {
 		return false;
 	}
-	if (readDeliverableTerminalNotificationRequest(runId)?.requestId !== request.requestId) {
+	if ((await readDeliverableTerminalNotificationRequest(runId))?.requestId !== request.requestId) {
 		return false;
 	}
 	try {
@@ -2232,7 +2231,7 @@ async function receiptWaitedPiTerminalNotification(runId: string, ctx: Hyperchar
 	if ((await activePiUserInteraction(ctx)) !== undefined) {
 		return undefined;
 	}
-	const request = readDeliverableTerminalNotificationRequest(runId);
+	const request = await readDeliverableTerminalNotificationRequest(runId);
 	if (request === undefined || !claimTerminalNotificationReceipt(runId, request.requestId, "pi", sessionId)) {
 		return undefined;
 	}
@@ -2309,40 +2308,41 @@ function spawnRunner(config: HyperchartRunnerConfig): number {
 	}
 }
 
-function watchRun(runId: string): Promise<HyperchartRunStatus> {
-	return new Promise((resolveDone) => {
-		const timer = setInterval(
-			AsyncLocalStorage.bind(() => {
-				const status = reconcileStoppedRunner(runId);
-				if (status === undefined) {
-					return;
-				}
+/** Resolves at terminal status. Status-change notifications wake it; the one-second fallback covers lost ones. */
+async function watchRun(runId: string): Promise<HyperchartRunStatus> {
+	const store = await openRunLogStore(runId, { access: "read" });
+	try {
+		for (;;) {
+			// Arm before reading so a terminal write landing mid-read wakes this at once.
+			const wait = store.watchRunChange(["status"], { timeoutMs: 1_000 });
+			const status = await reconcileStoppedRunner(store);
+			if (status !== undefined) {
 				if (isTerminalRunState(status.state)) {
-					clearInterval(timer);
-					resolveDone(status);
-					return;
+					wait.cancel();
+					return status;
 				}
 				if (!isRunLive(status) && Date.now() - status.updatedAt > 20_000) {
-					recoverStaleRunTerminalNotification(runId);
-					const recovered = readRunStatus(runId);
+					await recoverStaleRunTerminalNotification(runId);
+					const recovered = await store.readRunStatus();
 					if (recovered !== undefined && isTerminalRunState(recovered.state)) {
-						clearInterval(timer);
-						resolveDone(recovered);
+						wait.cancel();
+						return recovered;
 					}
 				}
-			}),
-			1_000,
-		);
-		timer.unref();
-	});
+			}
+			await wait.changed;
+		}
+	} finally {
+		await store.close();
+	}
 }
 
 // A runner can exit during shutdown before its final status write. Process death
 // ends the stop wait, but does not prove that application cleanup succeeded.
-function reconcileStoppedRunner(runId: string): HyperchartRunStatus | undefined {
-	const status = readRunStatus(runId);
+async function reconcileStoppedRunner(store: RunLogStore): Promise<HyperchartRunStatus | undefined> {
+	const status = await store.readRunStatus();
 	if (status?.state === "stopping" && status.pid !== undefined && !isPidAlive(status.pid)) {
-		return patchRunStatus(runId, {
+		return store.patchRunStatus({
 			state: "stopped",
 			branchIds: [],
 			exitCode: undefined,
@@ -2403,7 +2403,7 @@ async function activeRunIdsForWorkDir(cwd: string): Promise<string[]> {
 			if (meta === undefined || resolve(meta.workDir) !== resolve(cwd)) {
 				return undefined;
 			}
-			const status = readRunStatus(runId);
+			const status = await readRunStatus(runId);
 			return status !== undefined && (isRunLive(status) || ["starting", "running", "stopping"].includes(status.state))
 				? runId
 				: undefined;
@@ -2419,11 +2419,11 @@ async function stopOwnedRun(runId: string, ctx: HyperchartContext): Promise<{ ru
 	}
 	assertRunId(runId);
 	const active = currentRuns().get(runId);
-	const status = readRunStatus(runId);
-	patchRunStatus(runId, { state: "stopping" });
+	const status = await readRunStatus(runId);
+	await patchRunStatus(runId, { state: "stopping" });
 	const pid = status?.pid !== undefined && isPidAlive(status.pid) ? status.pid : undefined;
 	if (pid === undefined) {
-		patchRunStatus(runId, { state: "stopped", exitCode: 0, error: "runner was not live" });
+		await patchRunStatus(runId, { state: "stopped", exitCode: 0, error: "runner was not live" });
 	} else {
 		process.kill(pid, "SIGTERM");
 	}
@@ -2431,7 +2431,12 @@ async function stopOwnedRun(runId: string, ctx: HyperchartContext): Promise<{ ru
 	// caller that immediately removes, rewinds, or reuses its run directory.
 	if (pid !== undefined) {
 		await waitForRunProcessExit(pid);
-		reconcileStoppedRunner(runId);
+		const store = await openRunLogStore(runId, { access: "read" });
+		try {
+			await reconcileStoppedRunner(store);
+		} finally {
+			await store.close();
+		}
 	}
 	if (active !== undefined) {
 		await active.done;
@@ -2474,7 +2479,7 @@ async function deleteRun(runId: string, ctx: HyperchartContext): Promise<void> {
 	if (resolve(meta.workDir) !== resolve(ctx.cwd)) {
 		throw new Error(`Run '${runId}' belongs to ${meta.workDir}; open that directory first`);
 	}
-	const status = readRunStatus(runId);
+	const status = await readRunStatus(runId);
 	const live = isRunLive(status);
 	const confirmed = await ctx.ui.confirm(
 		`Delete hyperchart run ${runId}?`,
@@ -2632,7 +2637,7 @@ async function loadRunHistoryEntry(runId: string, cwd: string): Promise<RunHisto
 	if (resolve(meta.workDir) !== resolve(cwd)) {
 		return undefined;
 	}
-	const status = readRunStatus(runId);
+	const status = await readRunStatus(runId);
 	let final = status?.state === "complete" || status?.state === "failed";
 	let terminalState: RunTerminalState | undefined =
 		status?.state === "complete" || status?.state === "failed" ? status.state : undefined;
@@ -2689,7 +2694,7 @@ async function loadRunSnapshot(runId: string, suppliedMeta?: RunMeta): Promise<R
 	if (!parsed.ok) {
 		throw new Error(parsed.diagnostics.map((diagnostic) => diagnostic.message).join("\n"));
 	}
-	const status = readRunStatus(runId);
+	const status = await readRunStatus(runId);
 	return {
 		runId,
 		ast: parsed.ast,

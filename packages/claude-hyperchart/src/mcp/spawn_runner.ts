@@ -1,11 +1,11 @@
-import { resolveRunPaths } from "@surprisal/hyperchart/runtime";
+import { openRunLogStore, resolveRunPaths } from "@surprisal/hyperchart/runtime";
 import { closeSync, existsSync, openSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { recoverStaleRunTerminalNotification } from "@surprisal/hyperchart/runtime";
 import type { HyperchartRunnerConfig } from "@surprisal/hyperchart/runner";
-import { isRunLive, isTerminalRunState, readRunStatus, type HyperchartRunStatus } from "@surprisal/hyperchart/sessions";
+import { isRunLive, isTerminalRunState, type HyperchartRunStatus } from "@surprisal/hyperchart/sessions";
 
 function runnerEntry(): string {
 	const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -47,27 +47,31 @@ export function spawnDetachedRunner(config: HyperchartRunnerConfig): number {
 }
 
 /** Resolves when the run reaches terminal status, recovering a dead runner through the durable outbox helper. */
-export function watchRun(runId: string): Promise<HyperchartRunStatus> {
-	return new Promise((resolveDone) => {
-		const timer = setInterval(() => {
-			const status = readRunStatus(runId);
-			if (status === undefined) {
-				return;
-			}
-			if (isTerminalRunState(status.state)) {
-				clearInterval(timer);
-				resolveDone(status);
-				return;
-			}
-			if (!isRunLive(status) && Date.now() - status.updatedAt > 20_000) {
-				recoverStaleRunTerminalNotification(runId);
-				const recovered = readRunStatus(runId);
-				if (recovered !== undefined && isTerminalRunState(recovered.state)) {
-					clearInterval(timer);
-					resolveDone(recovered);
+export async function watchRun(runId: string): Promise<HyperchartRunStatus> {
+	const store = await openRunLogStore(runId, { access: "read" });
+	try {
+		for (;;) {
+			// Armed before reading so a terminal write landing mid-read wakes this at once;
+			// the one-second fallback covers lost notifications.
+			const wait = store.watchRunChange(["status"], { timeoutMs: 1_000 });
+			const status = await store.readRunStatus();
+			if (status !== undefined) {
+				if (isTerminalRunState(status.state)) {
+					wait.cancel();
+					return status;
+				}
+				if (!isRunLive(status) && Date.now() - status.updatedAt > 20_000) {
+					await recoverStaleRunTerminalNotification(runId);
+					const recovered = await store.readRunStatus();
+					if (recovered !== undefined && isTerminalRunState(recovered.state)) {
+						wait.cancel();
+						return recovered;
+					}
 				}
 			}
-		}, 1_000);
-		timer.unref();
-	});
+			await wait.changed;
+		}
+	} finally {
+		await store.close();
+	}
 }

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it, vi } from "vitest";
 import { register } from "../../packages/pi-hyperchart/extensions/hyperchart.js";
-import type { RunMeta } from "../../packages/hyperchart/src/runtime/generic/run_dir.js";
+import { deleteRunStorage, type RunMeta } from "../../packages/hyperchart/src/runtime/generic/run_dir.js";
 import {
 	resolveRunPaths,
 	withRunStorage,
@@ -50,11 +50,19 @@ type Tool = {
 	): Promise<unknown>;
 };
 type Hook = (event: { reason?: string }, ctx: ExtensionCommandContext) => Promise<void>;
+// PostgreSQL-backed runs keep operational status in hyperchart_run_status, so those
+// cases need a real database; they are reported as skipped without HYPERCHART_PG_DSN.
+const dsn = process.env.HYPERCHART_PG_DSN;
+const itPg = dsn === undefined ? it.skip : it;
 const roots: string[] = [];
-afterEach(() => {
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	metadata.clear();
+	for (const cleanup of cleanups.splice(0)) {
+		await cleanup().catch(() => {});
+	}
 	for (const root of roots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -66,13 +74,16 @@ function fixture(kind: RunStorage["kind"]) {
 	const storage: RunStorage =
 		kind === "jsonl"
 			? { kind, rootDir: join(root, "runs"), layout: "sha256" }
-			: { kind, rootDir: join(root, "runs"), layout: "sha256", dsn: "postgres://unused.invalid/transport-is-mocked" };
+			: { kind, rootDir: join(root, "runs"), layout: "sha256", dsn: dsn as string };
 	const chartPath = join(root, "chart.mjs");
 	writeFileSync(
 		chartPath,
 		'export default {kind:"chart",id:"terminal-test",initial:"done",states:{done:{kind:"final"}}};',
 	);
 	const runId = "terminal-test";
+	if (kind === "postgres") {
+		cleanups.push(() => withRunStorage(storage, () => deleteRunStorage(runId)));
+	}
 	metadata.set(runId, {
 		chartPath,
 		chartId: "terminal-test",
@@ -121,8 +132,8 @@ function fixture(kind: RunStorage["kind"]) {
 		execute: (params: Record<string, unknown>) =>
 			tool.execute("test", params, new AbortController().signal, () => {}, ctx),
 		finish: () =>
-			scoped(() => {
-				persistTerminalNotificationRequest(runId, {
+			scoped(async () => {
+				await persistTerminalNotificationRequest(runId, {
 					runId,
 					branchId: "main",
 					chartId: "terminal-test",
@@ -131,7 +142,12 @@ function fixture(kind: RunStorage["kind"]) {
 					artifacts: [],
 					error: "launch failed",
 				});
-				patchRunStatus(runId, { chartId: "terminal-test", state: "failed", branchIds: [], error: "launch failed" });
+				await patchRunStatus(runId, {
+					chartId: "terminal-test",
+					state: "failed",
+					branchIds: [],
+					error: "launch failed",
+				});
 			}),
 		receipted: () => scoped(() => hasTerminalNotificationReceipt(runId, "pi", "owner")),
 	};
@@ -140,57 +156,61 @@ function fixture(kind: RunStorage["kind"]) {
 for (const kind of ["jsonl", "postgres"] as const) {
 	for (const mode of ["fresh", "attach"] as const) {
 		for (const sendFails of [false, true]) {
-			it(`${kind} ${mode}: completion ${sendFails ? "contains delivery failure and retries" : "delivers and cleans up"}`, async () => {
-				const f = fixture(kind);
-				await f.hook("session_start");
-				vi.useFakeTimers();
-				vi.spyOn(process, "kill").mockReturnValue(true);
-				const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-				if (mode === "attach") {
-					f.scoped(() =>
-						patchRunStatus(f.runId, {
-							chartId: "terminal-test",
-							state: "running",
-							branchIds: ["main"],
-							pid: 800091,
-							heartbeatAt: Date.now(),
-						}),
-					);
-				}
-				await f.execute({
-					action: "run",
-					...(mode === "attach" ? { runId: f.runId, branchId: "main" } : { chartPath: f.chartPath }),
-				});
-				if (sendFails) {
-					f.sendMessage.mockImplementationOnce(() => {
-						throw new Error("send failed");
+			(kind === "postgres" ? itPg : it)(
+				`${kind} ${mode}: completion ${sendFails ? "contains delivery failure and retries" : "delivers and cleans up"}`,
+				async () => {
+					const f = fixture(kind);
+					await f.hook("session_start");
+					vi.useFakeTimers();
+					vi.spyOn(process, "kill").mockReturnValue(true);
+					const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+					if (mode === "attach") {
+						await f.scoped(() =>
+							patchRunStatus(f.runId, {
+								chartId: "terminal-test",
+								state: "running",
+								branchIds: ["main"],
+								pid: 800091,
+								heartbeatAt: Date.now(),
+							}),
+						);
+					}
+					await f.execute({
+						action: "run",
+						...(mode === "attach" ? { runId: f.runId, branchId: "main" } : { chartPath: f.chartPath }),
 					});
-				}
-				f.finish();
-				await vi.advanceTimersByTimeAsync(1000);
-				expect(f.sendMessage).toHaveBeenCalledTimes(1);
-				expect(f.ctx.ui.setWidget).toHaveBeenCalledWith(`hyperchart:${f.runId}`, undefined);
-				expect(f.receipted()).toBe(!sendFails);
-				if (sendFails) {
-					expect(errors).toHaveBeenCalledWith(
-						expect.stringContaining("background completion failed"),
-						expect.objectContaining({ message: "send failed" }),
-					);
+					if (sendFails) {
+						f.sendMessage.mockImplementationOnce(() => {
+							throw new Error("send failed");
+						});
+					}
+					await f.finish();
+					await vi.advanceTimersByTimeAsync(1000);
+					// PostgreSQL status reads are real I/O behind the faked watcher tick.
+					await vi.waitFor(() => expect(f.sendMessage).toHaveBeenCalledTimes(1));
+					expect(f.ctx.ui.setWidget).toHaveBeenCalledWith(`hyperchart:${f.runId}`, undefined);
+					expect(f.receipted()).toBe(!sendFails);
+					if (sendFails) {
+						expect(errors).toHaveBeenCalledWith(
+							expect.stringContaining("background completion failed"),
+							expect.objectContaining({ message: "send failed" }),
+						);
+						await f.hook("agent_settled");
+						expect(f.sendMessage).toHaveBeenCalledTimes(2);
+						expect(f.receipted()).toBe(true);
+					} else {
+						expect(errors).not.toHaveBeenCalled();
+					}
 					await f.hook("agent_settled");
-					expect(f.sendMessage).toHaveBeenCalledTimes(2);
-					expect(f.receipted()).toBe(true);
-				} else {
-					expect(errors).not.toHaveBeenCalled();
-				}
-				await f.hook("agent_settled");
-				expect(f.sendMessage).toHaveBeenCalledTimes(sendFails ? 2 : 1);
-				await f.hook("session_shutdown");
-			});
+					expect(f.sendMessage).toHaveBeenCalledTimes(sendFails ? 2 : 1);
+					await f.hook("session_shutdown");
+				},
+			);
 		}
 	}
 }
 
-it("PostgreSQL wait returns terminal status without invoking JSONL gate ownership", async () => {
+itPg("PostgreSQL wait returns terminal status without invoking JSONL gate ownership", async () => {
 	const f = fixture("postgres");
 	await f.hook("session_start");
 	vi.useFakeTimers();
@@ -199,7 +219,7 @@ it("PostgreSQL wait returns terminal status without invoking JSONL gate ownershi
 	await vi.waitFor(() =>
 		expect(f.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Started hyperchart run"), "info"),
 	);
-	f.finish();
+	await f.finish();
 	await vi.advanceTimersByTimeAsync(1000);
 	await expect(pending).resolves.toMatchObject({ details: { boundary: "terminal", status: { state: "failed" } } });
 	expect(f.sendMessage).not.toHaveBeenCalled();

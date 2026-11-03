@@ -1,100 +1,37 @@
-import { resolveRunPaths, currentRunStorage, withRunStorage } from "./run_paths.js";
 import { randomUUID } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	readdirSync,
-	renameSync,
-	rmSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname, join, resolve } from "node:path";
 import type { ChartEvent } from "../../core/types.js";
-import type { BranchId, ResolvedGateLog } from "../../core/durable_events.js";
-import type { UserInteractionResponseCommit } from "./log_store.js";
-import { isRunLive, readRunStatus } from "./run_status.js";
+import type { BranchId } from "../../core/durable_events.js";
+import type { RunLogStore, UserInteractionResponseCommit } from "./log_store.js";
+import { openRunLogStore } from "./log_store_factory.js";
+import { isRunLive } from "./run_status_model.js";
+import {
+	CONTROL_VERSION,
+	isMoveCommit,
+	RunnerControlUnavailableError,
+	type RunnerControlRequest,
+	type RunnerControlResult,
+	type RunnerMoveBranchCommit,
+	type RunnerMoveBranchRequest,
+	type RunnerUserResponseRequest,
+} from "./runner_control_model.js";
 
-const CONTROL_VERSION = 1;
-const CONTROL_POLL_MS = 50;
-const CONTROL_TIMEOUT_MS = 30_000;
+export {
+	RunnerControlUnavailableError,
+	type RunnerControlRequest,
+	type RunnerControlResult,
+	type RunnerMoveBranchCommit,
+	type RunnerMoveBranchRequest,
+	type RunnerMoveBranchResult,
+	type RunnerUserResponseRequest,
+	type RunnerUserResponseResult,
+} from "./runner_control_model.js";
 
-type RunnerControlBase = Readonly<{
-	version: 1;
-	id: string;
-	attemptId: string;
-	branchId: BranchId;
-	createdAt: number;
-}>;
-
-export type RunnerUserResponseRequest = RunnerControlBase &
-	Readonly<{
-		kind: "respond_user_interaction";
-		gateSeqId: number;
-		event: ChartEvent;
-	}>;
-
-export type RunnerMoveBranchRequest = RunnerControlBase &
-	Readonly<{
-		kind: "move_branch";
-		targetHeadSeqId: number | null;
-	}>;
-
-export type RunnerControlRequest = RunnerUserResponseRequest | RunnerMoveBranchRequest;
-
-type RunnerControlFailure = Readonly<{
-	version: 1;
-	kind: RunnerControlRequest["kind"];
-	requestId: string;
-	attemptId: string;
-	ok: false;
-	error: string;
-	completedAt: number;
-}>;
-
-export type RunnerUserResponseResult =
-	| Readonly<{
-			version: 1;
-			kind: "respond_user_interaction";
-			requestId: string;
-			attemptId: string;
-			ok: true;
-			idempotent: boolean;
-			record: ResolvedGateLog;
-			completedAt: number;
-	  }>
-	| RunnerControlFailure;
-
-export type RunnerMoveBranchCommit = Readonly<{
-	moveSeqId: number;
-	previousHeadSeqId: number | null;
-	preservedRecords: number;
-}>;
-
-export type RunnerMoveBranchResult =
-	| Readonly<{
-			version: 1;
-			kind: "move_branch";
-			requestId: string;
-			attemptId: string;
-			ok: true;
-			moveSeqId: number;
-			previousHeadSeqId: number | null;
-			preservedRecords: number;
-			completedAt: number;
-	  }>
-	| RunnerControlFailure;
-
-export type RunnerControlResult = RunnerUserResponseResult | RunnerMoveBranchResult;
 export type RunnerControlCommit = UserInteractionResponseCommit | RunnerMoveBranchCommit;
 
-export class RunnerControlUnavailableError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "RunnerControlUnavailableError";
-	}
-}
+/** Fallback wake-ups only; change notifications normally wake waiters within milliseconds. */
+const HOST_WAIT_FALLBACK_MS = 1_000;
+const RUNNER_WAIT_FALLBACK_MS = 1_000;
+const CONTROL_TIMEOUT_MS = 30_000;
 
 /** Submit a gate response through the owning live runtime and wait for its durable acknowledgement. */
 export async function requestLiveRunnerUserResponse(
@@ -145,97 +82,39 @@ export async function requestLiveRunnerBranchMove(
 	};
 }
 
-/** Runner-owned control drain. Commands are transport only; the journal remains semantic truth. */
+/**
+ * Runner-owned control drain. Commands are transport only; the journal remains
+ * semantic truth. The wait is persistent: it keeps a detached runtime alive while
+ * every branch is durably parked at a user gate. Controller shutdown disposes it.
+ */
 export function watchRunnerControl(
 	runId: string,
 	attemptId: string,
 	deliver: (request: RunnerControlRequest) => Promise<RunnerControlCommit>,
 ): () => void {
-	let disposed = false;
-	let draining = false;
-	const drain = async () => {
-		if (disposed || draining) {
-			return;
-		}
-		draining = true;
+	const controller = new AbortController();
+	void (async () => {
+		const store = await openRunLogStore(runId, { access: "read" });
 		try {
-			for (const file of requestFiles(runId)) {
-				if (disposed) {
-					break;
-				}
-				const path = join(requestsDir(runId), file);
-				const request = readRequest(path);
-				if (request === undefined) {
-					safeUnlink(path);
-					continue;
-				}
-				if (request.attemptId !== attemptId) {
-					safeUnlink(path);
-					continue;
-				}
-				let result: RunnerControlResult;
-				try {
-					const committed = await deliver(request);
-					if (request.kind === "move_branch") {
-						if (!isMoveCommit(committed)) {
-							throw new Error("Runner move control returned invalid commit metadata");
-						}
-						result = {
-							version: CONTROL_VERSION,
-							kind: request.kind,
-							requestId: request.id,
-							attemptId,
-							ok: true,
-							...committed,
-							completedAt: Date.now(),
-						};
-					} else {
-						if (typeof committed !== "object" || committed === null || !("record" in committed)) {
-							throw new Error("Runner response control returned an invalid commit");
-						}
-						result = {
-							version: CONTROL_VERSION,
-							kind: request.kind,
-							requestId: request.id,
-							attemptId,
-							ok: true,
-							idempotent: committed.idempotent,
-							record: committed.record,
-							completedAt: Date.now(),
-						};
-					}
-				} catch (error) {
-					result = {
-						version: CONTROL_VERSION,
-						kind: request.kind,
-						requestId: request.id,
-						attemptId,
-						ok: false,
-						error: error instanceof Error ? error.message : String(error),
-						completedAt: Date.now(),
-					};
-				}
-				try {
-					publishJsonExclusive(resultPath(runId, request.id), result);
-				} catch (error) {
-					if (!isNodeError(error) || error.code !== "EEXIST") {
-						continue;
-					}
-				}
-				safeUnlink(path);
+			while (!controller.signal.aborted) {
+				// Arm before draining: a request published during the drain wakes the next iteration at once.
+				const wait = store.watchRunChange(["control"], {
+					timeoutMs: RUNNER_WAIT_FALLBACK_MS,
+					signal: controller.signal,
+					persistent: true,
+				});
+				await drainControlRequests(store, attemptId, deliver, controller.signal);
+				await wait.changed;
+			}
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				console.warn(`Hyperchart runner control watcher stopped: ${errorMessage(error)}`);
 			}
 		} finally {
-			draining = false;
+			await store.close();
 		}
-	};
-	void drain();
-	// This referenced control loop keeps a detached runtime alive while every branch is
-	// durably waiting at a user gate. Controller shutdown clears it.
-	const timer = setInterval(() => void drain(), CONTROL_POLL_MS);
-	return () => {
-		disposed = true;
-		clearInterval(timer);
-	};
+	})();
+	return () => controller.abort();
 }
 
 /** Backward-compatible response-only watcher used by focused admission tests. */
@@ -252,212 +131,126 @@ export function watchRunnerUserResponses(
 	});
 }
 
+async function drainControlRequests(
+	store: RunLogStore,
+	attemptId: string,
+	deliver: (request: RunnerControlRequest) => Promise<RunnerControlCommit>,
+	signal: AbortSignal,
+): Promise<void> {
+	for (const request of await store.listControlRequests()) {
+		if (signal.aborted) {
+			return;
+		}
+		if (request.attemptId !== attemptId) {
+			await store.discardControlRequest(request.id);
+			continue;
+		}
+		const result = await resultFor(request, attemptId, deliver);
+		// A result already published for this id (for example by a previous drain
+		// interrupted before discarding the request) stays; this request is done either way.
+		await store.publishControlResult(result);
+		await store.discardControlRequest(request.id);
+	}
+}
+
+async function resultFor(
+	request: RunnerControlRequest,
+	attemptId: string,
+	deliver: (request: RunnerControlRequest) => Promise<RunnerControlCommit>,
+): Promise<RunnerControlResult> {
+	try {
+		const committed = await deliver(request);
+		if (request.kind === "move_branch") {
+			if (!isMoveCommit(committed)) {
+				throw new Error("Runner move control returned invalid commit metadata");
+			}
+			return {
+				version: CONTROL_VERSION,
+				kind: request.kind,
+				requestId: request.id,
+				attemptId,
+				ok: true,
+				...committed,
+				completedAt: Date.now(),
+			};
+		}
+		if (typeof committed !== "object" || committed === null || !("record" in committed)) {
+			throw new Error("Runner response control returned an invalid commit");
+		}
+		return {
+			version: CONTROL_VERSION,
+			kind: request.kind,
+			requestId: request.id,
+			attemptId,
+			ok: true,
+			idempotent: committed.idempotent,
+			record: committed.record,
+			completedAt: Date.now(),
+		};
+	} catch (error) {
+		return {
+			version: CONTROL_VERSION,
+			kind: request.kind,
+			requestId: request.id,
+			attemptId,
+			ok: false,
+			error: errorMessage(error),
+			completedAt: Date.now(),
+		};
+	}
+}
+
 async function publishAndWait(
 	runId: string,
 	request: RunnerControlRequest,
 	options: { timeoutMs?: number; pollMs?: number },
 ): Promise<Extract<RunnerControlResult, { ok: true }>> {
-	publishJsonExclusive(requestPath(runId, request.id), request);
-	return waitForResult(runId, request, options);
-}
-
-function waitForResult(
-	runId: string,
-	request: RunnerControlRequest,
-	options: { timeoutMs?: number; pollMs?: number },
-): Promise<Extract<RunnerControlResult, { ok: true }>> {
 	const timeoutMs = options.timeoutMs ?? CONTROL_TIMEOUT_MS;
-	const pollMs = options.pollMs ?? CONTROL_POLL_MS;
+	const fallbackMs = options.pollMs ?? HOST_WAIT_FALLBACK_MS;
 	const started = Date.now();
-	return new Promise((resolveResult, rejectResult) => {
-		const finish = (callback: () => void) => {
-			clearInterval(timer);
-			callback();
+	const store = await openRunLogStore(runId, { access: "read" });
+	try {
+		await store.publishControlRequest(request);
+		const abandon = async (message: string): Promise<never> => {
+			await store.discardControlRequest(request.id);
+			throw new RunnerControlUnavailableError(message);
 		};
-		const check = () => {
-			const result = readResult(resultPath(runId, request.id));
+		for (;;) {
+			// Arm before reading so an acknowledgement landing mid-read is not lost to the fallback.
+			const wait = store.watchRunChange(["control", "status"], {
+				timeoutMs: Math.min(fallbackMs, Math.max(1, timeoutMs - (Date.now() - started))),
+			});
+			const result = await store.readControlResult(request.id);
 			if (result !== undefined) {
-				return finish(() => {
-					rmSync(resultPath(runId, request.id), { force: true });
-					if (result.attemptId !== request.attemptId) {
-						return rejectResult(
-							new RunnerControlUnavailableError("Runner attempt changed before control acknowledgement"),
-						);
-					}
-					if (result.kind !== request.kind) {
-						return rejectResult(new RunnerControlUnavailableError("Runner returned the wrong control result kind"));
-					}
-					if (!result.ok) {
-						return rejectResult(new Error(result.error));
-					}
-					resolveResult(result);
-				});
+				wait.cancel();
+				await store.discardControlResult(request.id);
+				if (result.attemptId !== request.attemptId) {
+					throw new RunnerControlUnavailableError("Runner attempt changed before control acknowledgement");
+				}
+				if (result.kind !== request.kind) {
+					throw new RunnerControlUnavailableError("Runner returned the wrong control result kind");
+				}
+				if (!result.ok) {
+					throw new Error(result.error);
+				}
+				return result;
 			}
-			const status = readRunStatus(runId);
+			const status = await store.readRunStatus();
 			if (!isRunLive(status) || status?.attemptId !== request.attemptId) {
-				return finish(() => {
-					rmSync(requestPath(runId, request.id), { force: true });
-					rejectResult(
-						new RunnerControlUnavailableError("Owning Hyperchart runtime stopped before control acknowledgement"),
-					);
-				});
+				wait.cancel();
+				await abandon("Owning Hyperchart runtime stopped before control acknowledgement");
 			}
 			if (Date.now() - started >= timeoutMs) {
-				return finish(() => {
-					rmSync(requestPath(runId, request.id), { force: true });
-					rejectResult(
-						new RunnerControlUnavailableError(
-							"Timed out waiting for owning Hyperchart runtime control acknowledgement",
-						),
-					);
-				});
+				wait.cancel();
+				await abandon("Timed out waiting for owning Hyperchart runtime control acknowledgement");
 			}
-		};
-		const timer = setInterval(check, pollMs);
-		timer.unref();
-		check();
-	});
+			await wait.changed;
+		}
+	} finally {
+		await store.close();
+	}
 }
 
-function controlDir(runId: string): string {
-	return resolve(resolveRunPaths(runId).runDir, "runner-control", "user-responses");
-}
-function requestsDir(runId: string): string {
-	return join(controlDir(runId), "requests");
-}
-function resultsDir(runId: string): string {
-	return join(controlDir(runId), "results");
-}
-function requestPath(runId: string, id: string): string {
-	return join(requestsDir(runId), `${id}.json`);
-}
-function resultPath(runId: string, id: string): string {
-	return join(resultsDir(runId), `${id}.json`);
-}
-function requestFiles(runId: string): string[] {
-	try {
-		return readdirSync(requestsDir(runId))
-			.filter((file) => file.endsWith(".json"))
-			.sort();
-	} catch {
-		return [];
-	}
-}
-function publishJsonExclusive(path: string, value: unknown): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-	try {
-		renameSync(temporary, path);
-	} catch (error) {
-		rmSync(temporary, { force: true });
-		throw error;
-	}
-}
-function readRequest(path: string): RunnerControlRequest | undefined {
-	if (!existsSync(path)) {
-		return undefined;
-	}
-	try {
-		const value = JSON.parse(readFileSync(path, "utf8")) as Partial<RunnerControlRequest>;
-		if (
-			value.version !== CONTROL_VERSION ||
-			typeof value.id !== "string" ||
-			typeof value.attemptId !== "string" ||
-			typeof value.branchId !== "string" ||
-			typeof value.createdAt !== "number"
-		) {
-			return undefined;
-		}
-		if (value.kind === "move_branch") {
-			if (value.targetHeadSeqId !== null && !isPositiveInteger(value.targetHeadSeqId)) {
-				return undefined;
-			}
-			return value as RunnerMoveBranchRequest;
-		}
-		if (
-			value.kind !== "respond_user_interaction" ||
-			!isPositiveInteger(value.gateSeqId) ||
-			!isChartEvent(value.event)
-		) {
-			return undefined;
-		}
-		return value as RunnerUserResponseRequest;
-	} catch {
-		return undefined;
-	}
-}
-function readResult(path: string): RunnerControlResult | undefined {
-	if (!existsSync(path)) {
-		return undefined;
-	}
-	try {
-		const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown> & {
-			record?: Partial<ResolvedGateLog>;
-		};
-		if (
-			value.version !== CONTROL_VERSION ||
-			(value.kind !== "respond_user_interaction" && value.kind !== "move_branch") ||
-			typeof value.requestId !== "string" ||
-			typeof value.attemptId !== "string" ||
-			typeof value.ok !== "boolean" ||
-			typeof value.completedAt !== "number"
-		) {
-			return undefined;
-		}
-		if (!value.ok) {
-			return typeof value.error === "string" ? (value as unknown as RunnerControlFailure) : undefined;
-		}
-		if (value.kind === "move_branch") {
-			return isPositiveInteger(value.moveSeqId) &&
-				(value.previousHeadSeqId === null || isPositiveInteger(value.previousHeadSeqId)) &&
-				isNonNegativeInteger(value.preservedRecords)
-				? (value as unknown as RunnerMoveBranchResult)
-				: undefined;
-		}
-		if (
-			typeof value.idempotent !== "boolean" ||
-			(value.record?.type !== "user_interaction" && value.record?.type !== "gate") ||
-			value.record.kind !== "resolved" ||
-			!isPositiveInteger(value.record.seqId) ||
-			!isPositiveInteger(value.record.gateSeqId)
-		) {
-			return undefined;
-		}
-		return value as unknown as RunnerUserResponseResult;
-	} catch {
-		return undefined;
-	}
-}
-function isChartEvent(value: unknown): value is ChartEvent {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		!Array.isArray(value) &&
-		typeof (value as { type?: unknown }).type === "string"
-	);
-}
-function isMoveCommit(value: RunnerControlCommit): value is RunnerMoveBranchCommit {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"moveSeqId" in value &&
-		isPositiveInteger(value.moveSeqId) &&
-		(value.previousHeadSeqId === null || isPositiveInteger(value.previousHeadSeqId)) &&
-		isNonNegativeInteger(value.preservedRecords)
-	);
-}
-function isPositiveInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-function isNonNegativeInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-function safeUnlink(path: string): void {
-	try {
-		unlinkSync(path);
-	} catch {}
-}
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-	return error instanceof Error && "code" in error;
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }

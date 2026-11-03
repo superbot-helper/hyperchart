@@ -398,7 +398,7 @@ describe("hyperchart extension", () => {
 		const runId = "ambiguous-resume";
 		const { runDir } = createRun(runId, projectDir, writeChart("ambiguous-resume"));
 		writeTwoBranchV2Log(runDir);
-		withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
+		await withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
 		await expect(
 			registeredTool("hyperchart").execute(
 				"ambiguous-resume",
@@ -414,7 +414,7 @@ describe("hyperchart extension", () => {
 		const runId = "ambiguous-command-resume";
 		const { runDir } = createRun(runId, projectDir, writeChart("ambiguous-command-resume"));
 		writeTwoBranchV2Log(runDir);
-		withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
+		await withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
 		const { ctx, notifications } = commandContext(projectDir);
 
 		await registeredCommand().handler(`resume ${runId}`, ctx);
@@ -423,7 +423,7 @@ describe("hyperchart extension", () => {
 			message: expect.stringMatching(/action=run requires branchId.*2 durable branches.*main, experiment/),
 			type: "error",
 		});
-		expect(withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "stopped" });
+		expect(await withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "stopped" });
 	});
 
 	it("resumes the selected branch through the slash command and advertises the option", async () => {
@@ -435,7 +435,7 @@ describe("hyperchart extension", () => {
 		);
 		const { runDir } = createRun(runId, projectDir, chartPath);
 		writeTwoBranchFinalLog(runDir);
-		withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
+		await withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
 		const command = registeredCommand();
 		const { ctx, notifications } = commandContext(projectDir);
 
@@ -450,7 +450,7 @@ describe("hyperchart extension", () => {
 			branchIds: ["experiment"],
 		});
 		await vi.waitFor(
-			() => expect(withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "complete" }),
+			async () => expect(await withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "complete" }),
 			{ timeout: 60_000 },
 		);
 		await registeredTool("hyperchart").execute(
@@ -507,7 +507,7 @@ describe("hyperchart extension", () => {
 		createRun("legacy-unowned", projectDir, chartPath);
 		createRun("foreign-project", otherProjectDir, chartPath, "session-a");
 		const { runId: failedRunId, runDir: failedRunDir } = createRun("owned-failed", projectDir, chartPath, "session-a");
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(failedRunId, { branchIds: ["main"], chartId: "demo", state: "failed", exitCode: 1 }),
 		);
 		const { runId: completedRunId, runDir: completedRunDir } = createRun(
@@ -516,7 +516,7 @@ describe("hyperchart extension", () => {
 			chartPath,
 			"session-a",
 		);
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(completedRunId, { branchIds: ["main"], chartId: "demo", state: "complete", exitCode: 0 }),
 		);
 
@@ -611,7 +611,7 @@ describe("hyperchart extension", () => {
 		const foreignSession = createRun("foreign-terminal", projectDir, chartPath, "session-b");
 		const foreignWorkDir = createRun("foreign-workdir-terminal", otherProjectDir, chartPath, "session-a");
 		for (const { runId, runDir } of [owned, foreignSession, foreignWorkDir]) {
-			withRunStorage(testStorage(), () =>
+			await withRunStorage(testStorage(), () =>
 				persistTerminalNotificationRequest(runId, {
 					runId,
 					branchId: "main",
@@ -621,7 +621,7 @@ describe("hyperchart extension", () => {
 					artifacts: [],
 				}),
 			);
-			withRunStorage(testStorage(), () =>
+			await withRunStorage(testStorage(), () =>
 				patchRunStatus(runId, { branchIds: ["main"], chartId: "demo", state: "complete" }),
 			);
 		}
@@ -630,7 +630,7 @@ describe("hyperchart extension", () => {
 		const malformed = createRun("malformed-terminal", projectDir, chartPath, "session-a");
 		mkdirSync(join(malformed.runDir, "terminal-notification"), { recursive: true });
 		writeFileSync(join(malformed.runDir, "terminal-notification", "request.json"), "{not-json\n");
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(malformed.runId, { branchIds: ["main"], chartId: "demo", state: "complete" }),
 		);
 		let sessionStart: ((event: { reason: string }, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
@@ -670,7 +670,7 @@ describe("hyperchart extension", () => {
 	it("confirms only after Pi accepts the message and retries a pre-delivery failure", async () => {
 		const chartPath = writeChart("terminal-send-order");
 		const { runId, runDir } = createRun("terminal-send-order", projectDir, chartPath, "session-a");
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "terminal-send-order",
 				branchId: "main",
@@ -680,7 +680,7 @@ describe("hyperchart extension", () => {
 				artifacts: [],
 			}),
 		);
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(runId, { branchIds: ["main"], chartId: "demo", state: "complete" }),
 		);
 		let sessionStart: ((event: { reason: string }, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
@@ -721,7 +721,7 @@ describe("hyperchart extension", () => {
 	it("does not resend a terminal request already persisted in the Pi session", async () => {
 		const chartPath = writeChart("terminal-persisted");
 		const { runId, runDir } = createRun("persisted-terminal", projectDir, chartPath, "session-a");
-		const request = withRunStorage(testStorage(), () =>
+		const request = await withRunStorage(testStorage(), () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "persisted-terminal",
 				branchId: "main",
@@ -732,7 +732,7 @@ describe("hyperchart extension", () => {
 				error: "boom",
 			}),
 		);
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(runId, { branchIds: ["main"], chartId: "demo", state: "failed", error: "boom" }),
 		);
 		let sessionStart: ((event: { reason: string }, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
@@ -784,10 +784,10 @@ describe("hyperchart extension", () => {
 			prompt: "identical terminal",
 			artifacts: [],
 		};
-		const oldRequest = withRunStorage(testStorage(), () => persistTerminalNotificationRequest(runId, payload));
+		const oldRequest = await withRunStorage(testStorage(), () => persistTerminalNotificationRequest(runId, payload));
 		withRunStorage(testStorage(), () => removeTerminalNotificationOutbox(runId));
-		const newRequest = withRunStorage(testStorage(), () => persistTerminalNotificationRequest(runId, payload));
-		withRunStorage(testStorage(), () =>
+		const newRequest = await withRunStorage(testStorage(), () => persistTerminalNotificationRequest(runId, payload));
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(runId, { branchIds: ["main"], chartId: "demo", state: "complete" }),
 		);
 		expect(newRequest.requestId).not.toBe(oldRequest.requestId);
@@ -1036,7 +1036,7 @@ describe("hyperchart extension", () => {
 	it("stops one run through the consolidated tool", async () => {
 		const chartPath = writeChart("stoppable");
 		const { runId, runDir } = createRun("stoppable-run", projectDir, chartPath);
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(runId, {
 				branchIds: ["main"],
 				chartId: "demo",
@@ -1053,7 +1053,7 @@ describe("hyperchart extension", () => {
 			commandContext(projectDir).ctx,
 		);
 
-		expect(withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "stopped", exitCode: 0 });
+		expect(await withRunStorage(testStorage(), () => readRunStatus(runId))).toMatchObject({ state: "stopped", exitCode: 0 });
 		expect((result as { content: Array<{ text: string }> }).content[0]?.text).toContain(
 			"stoppable-run (marked stopped)",
 		);
@@ -1405,7 +1405,7 @@ describe("hyperchart extension", () => {
 		const runId = "branch-aware-inspect";
 		const { runDir } = createRun(runId, projectDir, writeChart("branch-aware-inspect"));
 		writeTwoBranchV2Log(runDir);
-		withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
+		await withRunStorage(testStorage(), () => patchRunStatus(runId, { branchIds: [], chartId: "demo", state: "stopped" }));
 		const tool = registeredTool("hyperchart");
 		const ctx = commandContext(projectDir).ctx;
 
@@ -1458,7 +1458,7 @@ describe("hyperchart extension", () => {
 				timestamp: 3,
 			},
 		]);
-		withRunStorage(testStorage(), () =>
+		await withRunStorage(testStorage(), () =>
 			patchRunStatus(runId, {
 				chartId: "demo",
 				state: "failed",

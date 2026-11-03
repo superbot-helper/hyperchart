@@ -166,7 +166,7 @@ The Pi package adds files that are useful but not semantic history:
 
 | File | Meaning |
 |---|---|
-| `status.json` | v2 pid, heartbeat, process state, current live `branchIds`, opaque runner-attempt identity, terminal error, timestamps |
+| `status.json` | v2 pid, heartbeat, process state, current live `branchIds`, opaque runner-attempt identity, terminal error, timestamps (JSONL backend; PostgreSQL keeps the same fields in `hyperchart_run_status`) |
 | `terminal-notification/request.json` | persist-once terminal prompt/outcome/artifact-path outbox with a fresh per-attempt UUID, written before terminal status |
 | `terminal-notification/receipts/<request-hash>/*.json` | generation-isolated, recoverable per-host/session terminal-delivery leases and confirmed receipts |
 | `terminal-notification-history/<generation>/` | complete outboxes archived when a terminal run starts another attempt; prior requests and receipts remain auditable but are no longer deliverable |
@@ -178,7 +178,7 @@ The Pi package adds files that are useful but not semantic history:
 | journal `emit` | inert ordered domain event and resolved JSON payload appended with accepted completion |
 | `user-interactions/<branchId>/<seqId>/receipts/*.json` | non-semantic per-host/session presentation claims and confirmations |
 | `user-interactions/<branchId>/<seqId>/receipts/*.published` | internal immutable publication-order markers used only for cross-process presentation arbitration |
-| `runner-control/user-responses/{requests,results}/*.json` | attempt-fenced, non-semantic command/ack transport to the sole live runtime writer; journal facts remain authoritative |
+| `runner-control/user-responses/{requests,results}/*.json` | attempt-fenced, non-semantic command/ack transport to the sole live runtime writer; journal facts remain authoritative. PostgreSQL keeps the same mailbox in `hyperchart_control` |
 | `sessions/progress.json` | optional branch-tagged agent progress summaries |
 | `sessions/<sanitized-branch-prefix>-<hash>/<actionUid>/<invocation>/` | collision-resistant branch-separated host conversation state and usage; there is no legacy-directory migration |
 | `sessions/steering/*.json` | requests carrying `branchId`; the runner routes each only to that branch's executor |

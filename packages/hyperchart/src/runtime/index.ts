@@ -29,6 +29,13 @@ export type {
 	UserInteractionResponseCommit,
 } from "./generic/log_store.js";
 export { MemoryLogStore } from "./generic/memory_log_store.js";
+export type {
+	RunChangeTopic,
+	RunChangeWait,
+	RunnerControlRequest,
+	RunnerControlResult,
+	WaitForRunChangeOptions,
+} from "./generic/runner_control_model.js";
 export {
 	currentRunLogStorage,
 	openRunLogStore,

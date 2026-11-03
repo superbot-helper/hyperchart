@@ -417,7 +417,7 @@ describe("journal-native user interactions", () => {
 	it("routes a live response through the owning runner control API", async () => {
 		const f = await fixture();
 		const attemptId = "attempt-live";
-		withRunStorage(f.storage, () =>
+		await withRunStorage(f.storage, () =>
 			patchRunStatus(f.runId, {
 				chartId: "chart",
 				state: "running",

@@ -30,9 +30,9 @@ afterEach(() => {
 	}
 });
 
-async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() > deadline) {
 			throw new Error("Timed out waiting for runner state");
 		}
@@ -164,11 +164,13 @@ describe("multi-branch process runner", () => {
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const controller = await createHyperchartRunnerController(config, () => new ControlledExecutor());
 			await controller.start();
-			expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.error).toContain(
-				"chart reached failed terminal state 'failed'",
-			);
 			expect(
-				withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.replayWarnings?.join("\n"),
+				(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.error,
+			).toContain("chart reached failed terminal state 'failed'");
+			expect(
+				(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.replayWarnings?.join(
+					"\n",
+				),
 			).toContain("skipped");
 		}
 	});
@@ -218,7 +220,7 @@ describe("multi-branch process runner", () => {
 
 		expect(built).toBe(0);
 		expect(controller.liveBranchIds).toEqual([]);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 			exitCode: 143,
@@ -284,13 +286,15 @@ describe("multi-branch process runner", () => {
 		});
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(closeResolved).toBe(false);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.state).toBe("starting");
+		expect((await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.state).toBe(
+			"starting",
+		);
 		releaseGate();
 		await closing;
 		await completion;
 
 		expect(built).toBe(0);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 			exitCode: 130,
@@ -332,7 +336,7 @@ describe("multi-branch process runner", () => {
 		await completion;
 
 		expect(executor.disposed).toBe(true);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 			exitCode: 130,
@@ -389,14 +393,16 @@ describe("multi-branch process runner", () => {
 		});
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(closeResolved).toBe(false);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.state).toBe("running");
+		expect((await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.state).toBe(
+			"running",
+		);
 		releaseBuild();
 		await closing;
 		await completion;
 
 		expect(executor.disposed).toBe(true);
 		expect(executor.emit).toBeUndefined();
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 		});
@@ -477,7 +483,7 @@ describe("multi-branch process runner", () => {
 
 		expect(executors.has("experiment")).toBe(false);
 		expect(executors.get("main")?.disposed).toBe(true);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 		});
@@ -590,7 +596,7 @@ describe("multi-branch process runner", () => {
 			},
 		);
 		expect(built).toBe(0);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "failed",
 			branchIds: [],
 			error: expect.stringMatching(/missing-a[\s\S]*missing-b/),
@@ -646,7 +652,7 @@ describe("multi-branch process runner", () => {
 		expect(built.map((entry) => entry.branchId)).toEqual(["main", "experiment"]);
 		expect(new Set(built.map((entry) => entry.executor)).size).toBe(2);
 		expect(activity.max).toBe(2);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			version: 2,
 			state: "complete",
 			branchIds: [],
@@ -714,28 +720,27 @@ describe("multi-branch process runner", () => {
 		expect(fork.branchId).toBe("experiment");
 		expect(executors.has("experiment")).toBe(false);
 		expect(controller.liveBranchIds).toEqual(["main"]);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.branchIds).toEqual([
-			"main",
-		]);
+		expect(
+			(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.branchIds,
+		).toEqual(["main"]);
 
 		const experimentOutcome = controller.startBranch("experiment");
 		expect(controller.liveBranchIds).toEqual(["main", "experiment"]);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.branchIds).toEqual([
-			"main",
-			"experiment",
-		]);
+		expect(
+			(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.branchIds,
+		).toEqual(["main", "experiment"]);
 		await expect(controller.startBranch("experiment")).rejects.toThrow(/already admitted/);
 		await waitFor(() => executors.get("experiment")?.emit !== undefined);
 		executors.get("experiment")?.complete();
 		expect(await experimentOutcome).toMatchObject({ branchId: "experiment", outcome: "complete" });
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.branchIds).toEqual([
-			"main",
-		]);
+		expect(
+			(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.branchIds,
+		).toEqual(["main"]);
 		expect(executors.get("experiment")?.disposed).toBe(true);
 
 		executors.get("main")?.complete();
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 		});
@@ -804,7 +809,7 @@ describe("multi-branch process runner", () => {
 		expect(await experimentOutcome).toEqual({ branchId: "experiment", outcome: "drained" });
 		expect(controller.liveBranchIds).toEqual(["main"]);
 		expect(await controller.activeBranchIds()).toEqual(["main"]);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "running",
 			branchIds: ["main"],
 		});
@@ -813,7 +818,7 @@ describe("multi-branch process runner", () => {
 
 		executors.get("main")?.complete();
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 		});
@@ -859,9 +864,11 @@ describe("multi-branch process runner", () => {
 		const experimentOutcome = controller.startBranch("experiment");
 		executors.get("main")?.complete();
 		await waitFor(
-			() => withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.branchIds.length === 1,
+			async () =>
+				(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.branchIds.length ===
+				1,
 		);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "running",
 			branchIds: ["experiment"],
 		});
@@ -870,7 +877,7 @@ describe("multi-branch process runner", () => {
 		executors.get("experiment")?.complete();
 		expect((await experimentOutcome).outcome).toBe("complete");
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 		});
@@ -930,7 +937,7 @@ describe("multi-branch process runner", () => {
 		executors.get("experiment")?.complete();
 		expect((await outcome).outcome).toBe("complete");
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 		});
@@ -984,7 +991,7 @@ describe("multi-branch process runner", () => {
 		expect(executors.has("broken")).toBe(false);
 		executors.get("main")?.complete();
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "failed",
 			branchIds: [],
 		});
@@ -1033,10 +1040,14 @@ describe("multi-branch process runner", () => {
 				new CompletingExecutor(config.branchId, { active: 0, max: 0 }, false, disposeGate, disposalStarted),
 		);
 		await started;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.state).toBe("running");
+		expect((await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.state).toBe(
+			"running",
+		);
 		releaseDispose();
 		await running;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))?.state).toBe("complete");
+		expect((await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir))))?.state).toBe(
+			"complete",
+		);
 	});
 
 	it("isolates sibling authored paths and materializes each workspace before its first action", async () => {
@@ -1149,7 +1160,7 @@ export default chart({ kind: "chart", id: "workspace-isolation", initial: "write
 		await waitFor(() => executors.get("main")?.emit !== undefined);
 		executors.get("main")?.complete();
 		await waitFor(() => controller.liveBranchIds.length === 0);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "running",
 			branchIds: [],
 		});
@@ -1169,7 +1180,7 @@ export default chart({ kind: "chart", id: "workspace-isolation", initial: "write
 		await waitFor(() => controller.liveBranchIds.length === 0);
 		hold.release();
 		await completion;
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "complete",
 			branchIds: [],
 			exitCode: 0,
@@ -1184,12 +1195,25 @@ export default chart({ kind: "chart", id: "workspace-isolation", initial: "write
 		mkdirSync(workDir, { recursive: true });
 		mkdirSync(runDir, { recursive: true });
 		const chartPath = join(workDir, "chart.mjs");
-		writeFileSync(chartPath, `export default { kind: "chart", id: "retry-admission", initial: "work", states: { work: { kind: "state", action: { kind: "agent", name: "worker" }, transitions: { DONE: "done" } }, done: { kind: "final" } } };\n`);
-		writeFileSync(join(runDir, "log.jsonl"), `${JSON.stringify({ kind: "branch", op: "create", seqId: 1, branchId: "main", headSeqId: null, committedAt: 1 })}\n`);
+		writeFileSync(
+			chartPath,
+			`export default { kind: "chart", id: "retry-admission", initial: "work", states: { work: { kind: "state", action: { kind: "agent", name: "worker" }, transitions: { DONE: "done" } }, done: { kind: "final" } } };\n`,
+		);
+		writeFileSync(
+			join(runDir, "log.jsonl"),
+			`${JSON.stringify({ kind: "branch", op: "create", seqId: 1, branchId: "main", headSeqId: null, committedAt: 1 })}\n`,
+		);
 		let failOnce = true;
 		const executors = new Map<string, ControlledExecutor>();
 		const controller = await createHyperchartRunnerController(
-			{ runId: "run", storage: fixtureStorage(runDir), chartPath, chartId: "retry-admission", workDir, branchId: "main" },
+			{
+				runId: "run",
+				storage: fixtureStorage(runDir),
+				chartPath,
+				chartId: "retry-admission",
+				workDir,
+				branchId: "main",
+			},
 			({ config }) => {
 				if (config.branchId === "retry" && failOnce) {
 					failOnce = false;
@@ -1247,7 +1271,7 @@ export default chart({ kind: "chart", id: "workspace-isolation", initial: "write
 		await completion;
 
 		expect(executor.disposed).toBe(true);
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 			exitCode: 130,
@@ -1294,7 +1318,7 @@ export default chart({ kind: "chart", id: "workspace-isolation", initial: "write
 			({ config }) => new CompletingExecutor(config.branchId, activity, config.branchId === "experiment"),
 		);
 		expect(activity).toMatchObject({ active: 0, max: 2 });
-		expect(withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
+		expect(await withRunStorage(fixtureStorage(runDir), () => readRunStatus(fixtureRunId(runDir)))).toMatchObject({
 			state: "failed",
 			branchIds: [],
 			exitCode: 1,

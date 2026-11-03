@@ -43,10 +43,10 @@ export async function rewindHyperchartRun(opts: RewindOptions): Promise<RewindRe
 	if (targetCount !== 1) {
 		throw new Error("rewind requires exactly one of state, seqId, or to=compatible");
 	}
-	const status = readRunStatus(opts.runId);
+	const status = await readRunStatus(opts.runId);
 	const live = isRunLive(status);
 	if (!live) {
-		assertStoppedRun(opts.runId, "rewinding");
+		await assertStoppedRun(opts.runId, "rewinding");
 	}
 	await assertRunOwnership(opts.runId, opts.cwd);
 	const meta = await loadRunMeta(opts.runId);
@@ -100,7 +100,7 @@ export async function rewindHyperchartRun(opts: RewindOptions): Promise<RewindRe
 			targetHeadSeqId: match.targetHeadSeqId,
 		});
 	} else {
-		patchRunStatus(opts.runId, {
+		await patchRunStatus(opts.runId, {
 			chartId: parsed.ast.id,
 			branchIds: [opts.branchId],
 			state: "stopped",

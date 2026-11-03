@@ -37,7 +37,7 @@ const roots: string[] = [];
 const fixtures: Array<{ storage: RunStorage; runId: string }> = [];
 afterEach(async () => {
 	for (const f of fixtures.splice(0)) {
-		withRunStorage(f.storage, () => patchRunStatus(f.runId, { state: "stopped" }));
+		await withRunStorage(f.storage, () => patchRunStatus(f.runId, { state: "stopped" }));
 	}
 	if (vi.isFakeTimers()) {
 		await vi.advanceTimersByTimeAsync(2000);
@@ -110,8 +110,8 @@ async function fixture(label: string, layout: RunStorage["layout"] = "run-id") {
 	fixtures.push(result);
 	return result;
 }
-function live(f: Awaited<ReturnType<typeof fixture>>, pid: number) {
-	withRunStorage(f.storage, () =>
+async function live(f: Awaited<ReturnType<typeof fixture>>, pid: number) {
+	await withRunStorage(f.storage, () =>
 		patchRunStatus(f.runId, { chartId: "test", branchIds: ["main"], state: "running", pid, heartbeatAt: Date.now() }),
 	);
 }
@@ -124,7 +124,7 @@ function signals(entries: Array<{ fixture: Awaited<ReturnType<typeof fixture>>; 
 		const target = entries.find((entry) => entry.pid === pid);
 		if (signal === "SIGTERM" && target !== undefined) {
 			alive.delete(pid);
-			withRunStorage(target.fixture.storage, () => patchRunStatus(target.fixture.runId, { state: "stopped" }));
+			void withRunStorage(target.fixture.storage, () => patchRunStatus(target.fixture.runId, { state: "stopped" }));
 			return true;
 		}
 		throw Object.assign(new Error("fixture process absent"), { code: "ESRCH" });
@@ -144,8 +144,8 @@ it("same-ID Pi registrations isolate view AST, stop wait and completion cleanup"
 		{ fixture: a, pid: 800001 },
 		{ fixture: b, pid: 800002 },
 	]);
-	live(a, 800001);
-	live(b, 800002);
+	await live(a, 800001);
+	await live(b, 800002);
 	const ah = host(a.storage, a.root);
 	const bh = host(b.storage, b.root);
 	await ah.execute({ action: "run", runId: a.runId, branchId: "main", wait: false });
@@ -162,7 +162,7 @@ it("same-ID Pi registrations isolate view AST, stop wait and completion cleanup"
 	expect(aStopped).toBe(true);
 	await stopA;
 	expect(kill).not.toHaveBeenCalledWith(800002, "SIGTERM");
-	expect(withRunStorage(b.storage, () => readRunStatus(b.runId)?.state)).toBe("running");
+	expect((await withRunStorage(b.storage, () => readRunStatus(b.runId)))?.state).toBe("running");
 	// A's completion must not erase B's active entry: B still waits for its own
 	// watch boundary instead of returning immediately after the signal.
 	let bStopped = false;
@@ -180,15 +180,17 @@ it("a stale Pi completion cannot remove a newer same-registration generation or 
 	const f = await fixture("generation");
 	vi.useFakeTimers();
 	signals([{ fixture: f, pid: 800003 }]);
-	live(f, 800003);
+	await live(f, 800003);
 	const h = host(f.storage, f.root);
 	await h.execute({ action: "run", runId: f.runId, branchId: "main", wait: false });
-	await vi.advanceTimersByTimeAsync(500);
+	// Watchers re-check on a fixed local interval; the second generation starts off-phase so the
+	// older watcher's next tick lands before the newer one's.
+	await vi.advanceTimersByTimeAsync(550);
 	await h.execute({ action: "run", runId: f.runId, branchId: "main", wait: false });
 	vi.mocked(h.ctx.ui.setWidget).mockClear();
-	withRunStorage(f.storage, () => patchRunStatus(f.runId, { state: "stopped" }));
-	await vi.advanceTimersByTimeAsync(500); // only the older watcher finishes
-	live(f, 800003);
+	await withRunStorage(f.storage, () => patchRunStatus(f.runId, { state: "stopped" }));
+	await vi.advanceTimersByTimeAsync(60); // only the older watcher finishes
+	await live(f, 800003);
 	expect(h.ctx.ui.setWidget).not.toHaveBeenCalledWith(`hyperchart:${f.runId}`, undefined);
 	let stopped = false;
 	const stopping = h.execute({ action: "stop", runId: f.runId }).then(() => {
@@ -216,7 +218,7 @@ it("stopped-owned IDs autocomplete from authoritative metadata, excluding foreig
 				workDir: workDir!,
 				createdAt: new Date().toISOString(),
 			});
-			patchRunStatus(runId!, { state: "stopped" });
+			await patchRunStatus(runId!, { state: "stopped" });
 		}
 	});
 	await withRunStorage(b.storage, async () => {
@@ -265,7 +267,7 @@ for (const attached of [true, false]) {
 			}
 			throw Object.assign(new Error("runner absent"), { code: "ESRCH" });
 		});
-		live(f, 800099);
+		await live(f, 800099);
 		const h = host(f.storage, f.root);
 		if (attached) {
 			await h.execute({ action: "run", runId: f.runId, branchId: "main" });
@@ -278,12 +280,12 @@ for (const attached of [true, false]) {
 		await vi.advanceTimersByTimeAsync(1000);
 		expect(settled).toBe(true);
 		await stopped;
-		expect(withRunStorage(f.storage, () => readRunStatus(f.runId))).toMatchObject({
+		expect(await withRunStorage(f.storage, () => readRunStatus(f.runId))).toMatchObject({
 			state: "stopped",
 			branchIds: [],
 			error: expect.stringContaining("cleanup could not be confirmed"),
 		});
-		expect(withRunStorage(f.storage, () => readRunStatus(f.runId)?.exitCode)).toBeUndefined();
+		expect((await withRunStorage(f.storage, () => readRunStatus(f.runId)))?.exitCode).toBeUndefined();
 	});
 }
 
@@ -297,7 +299,7 @@ it("stop keeps waiting while a stopping runner is still alive", async () => {
 		}
 		throw Object.assign(new Error("runner absent"), { code: "ESRCH" });
 	});
-	live(f, 800098);
+	await live(f, 800098);
 	const h = host(f.storage, f.root);
 	await h.execute({ action: "run", runId: f.runId, branchId: "main" });
 	let settled = false;
@@ -307,7 +309,7 @@ it("stop keeps waiting while a stopping runner is still alive", async () => {
 	await flush();
 	await vi.advanceTimersByTimeAsync(25000);
 	expect(settled).toBe(false);
-	expect(withRunStorage(f.storage, () => readRunStatus(f.runId)?.state)).toBe("stopping");
+	expect((await withRunStorage(f.storage, () => readRunStatus(f.runId)))?.state).toBe("stopping");
 	alive = false;
 	await vi.advanceTimersByTimeAsync(1000);
 	expect(settled).toBe(true);

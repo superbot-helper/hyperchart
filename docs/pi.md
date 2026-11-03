@@ -316,10 +316,11 @@ ${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/hypercharts/runs/<run-id>/
 | `log.jsonl` | core runtime | JSONL-backend append-only flat v2 records and named-branch entries |
 | PostgreSQL `hyperchart_run_meta` | host | PostgreSQL-backed chart path/export, working directory, run identity, originating Pi session |
 | PostgreSQL `hyperchart_journal` | core runtime | PostgreSQL-backed durable journal |
-| `status.json` | Pi runner | v2 process state, current live `branchIds`, pid, heartbeat, exit, aggregate error |
+| `status.json` | Pi runner | JSONL-backend v2 process state, current live `branchIds`, pid, heartbeat, exit, aggregate error; absent for PostgreSQL-backed runs |
+| PostgreSQL `hyperchart_run_status` | Pi runner + host | PostgreSQL-backed operational status with the same fields, one row per run |
 | journal `user_interaction/*` | sole runtime writer | rendered gate and validated external response facts |
 | `user-interactions/<branchId>/<seqId>/receipts/` | host | non-semantic presentation claims and confirmations |
-| `runner-control/user-responses/` | host + runtime | attempt-fenced non-semantic command acknowledgements; only the runtime writes a live journal |
+| `runner-control/user-responses/` | host + runtime | JSONL-backend attempt-fenced non-semantic command/acknowledgement mailbox; only the runtime writes a live journal. PostgreSQL uses `hyperchart_control` rows instead |
 | `sessions/<sanitized-branch-prefix>-<hash>/...` | Pi executor | collision-resistant branch/invocation-scoped agent sessions (no migration from the former unscoped layout) |
 | `sessions/steering/` | host + runner | branch-addressed steering queue routed only to the selected branch executor |
 | `artifact_store/objects/` | core runtime | content-addressable snapshots of accepted deliverables, referenced by completion-fact pins |

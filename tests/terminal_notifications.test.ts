@@ -60,7 +60,7 @@ function action(ast: ChartAst, state: string): StateActionAst {
 }
 
 describe("terminal notification outbox", () => {
-	it("renders scoped prompts and authoritative artifact paths", () => {
+	it("renders scoped prompts and authoritative artifact paths", async () => {
 		const root = tempRoot();
 		const workDir = join(root, "project");
 		mkdirSync(workDir);
@@ -150,7 +150,7 @@ describe("terminal notification outbox", () => {
 		expect(payload.prompt).toContain(join(workDir, "artifacts", "alpha.txt"));
 	});
 
-	it("gates delivery on matching terminal status and keeps receipts idempotent", () => {
+	it("gates delivery on matching terminal status and keeps receipts idempotent", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
@@ -163,21 +163,21 @@ describe("terminal notification outbox", () => {
 			workDir: runDir,
 			outcome: "complete",
 		});
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, { branchIds: ["main"], chartId: "done", state: "starting", attemptId: "attempt-current" }),
 		);
-		const first = withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
-		expect(withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload))).toEqual(first);
-		expect(() =>
+		const first = await withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
+		expect(await withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload))).toEqual(first);
+		await expect(
 			withRunStorage(storage, () => persistTerminalNotificationRequest(runId, { ...payload, prompt: "different" })),
-		).toThrow(/conflict/);
+		).rejects.toThrow(/conflict/);
 
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "running", heartbeatAt: Date.now() }));
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))).toBeUndefined();
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "failed" }));
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))).toBeUndefined();
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "complete", branchIds: [] }));
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))?.requestId).toBe(
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "running", heartbeatAt: Date.now() }));
+		expect(await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))).toBeUndefined();
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "failed" }));
+		expect(await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))).toBeUndefined();
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "complete", branchIds: [] }));
+		expect((await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId)))?.requestId).toBe(
 			first.requestId,
 		);
 
@@ -191,12 +191,12 @@ describe("terminal notification outbox", () => {
 		expect(withRunStorage(storage, () => hasTerminalNotificationReceipt(runId, "pi", "session"))).toBe(true);
 	});
 
-	it("archives a failed attempt before a resumed attempt publishes success", () => {
+	it("archives a failed attempt before a resumed attempt publishes success", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		const failed = withRunStorage(storage, () =>
+		const failed = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -208,7 +208,9 @@ describe("terminal notification outbox", () => {
 			}),
 		);
 		withRunStorage(storage, () => markTerminalNotificationReceipt(runId, failed.requestId, "pi", "session"));
-		withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }));
+		await withRunStorage(storage, () =>
+			patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }),
+		);
 
 		const archiveDir = withRunStorage(storage, () => archiveTerminalNotificationGeneration(runId));
 		expect(archiveDir).toBeDefined();
@@ -220,7 +222,7 @@ describe("terminal notification outbox", () => {
 		);
 		expect(existsSync(join(archiveDir!, receiptRelativePath))).toBe(true);
 
-		const complete = withRunStorage(storage, () =>
+		const complete = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -231,18 +233,18 @@ describe("terminal notification outbox", () => {
 			}),
 		);
 		expect(complete.requestId).not.toBe(failed.requestId);
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))?.requestId).toBe(
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
+		expect((await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId)))?.requestId).toBe(
 			complete.requestId,
 		);
 	});
 
-	it("never claims or confirms a cached request after its generation is replaced", () => {
+	it("never claims or confirms a cached request after its generation is replaced", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		const oldRequest = withRunStorage(storage, () =>
+		const oldRequest = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -253,9 +255,11 @@ describe("terminal notification outbox", () => {
 				error: "old failure",
 			}),
 		);
-		withRunStorage(storage, () => patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }));
+		await withRunStorage(storage, () =>
+			patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "starting" }),
+		);
 		withRunStorage(storage, () => archiveTerminalNotificationGeneration(runId));
-		const newRequest = withRunStorage(storage, () =>
+		const newRequest = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -265,7 +269,7 @@ describe("terminal notification outbox", () => {
 				artifacts: [],
 			}),
 		);
-		withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
+		await withRunStorage(storage, () => patchRunStatus(runId, { state: "complete" }));
 
 		expect(
 			withRunStorage(storage, () => claimTerminalNotificationReceipt(runId, oldRequest.requestId, "pi", "session")),
@@ -298,7 +302,7 @@ describe("terminal notification outbox", () => {
 		expect(withRunStorage(storage, () => hasTerminalNotificationReceipt(runId, "pi", "session"))).toBe(true);
 	});
 
-	it("gives a recreated post-rewind outbox a fresh identity even for an identical payload", () => {
+	it("gives a recreated post-rewind outbox a fresh identity even for an identical payload", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
@@ -311,21 +315,21 @@ describe("terminal notification outbox", () => {
 			prompt: "same terminal payload",
 			artifacts: [],
 		};
-		const beforeRewind = withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
-		expect(withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload)).requestId).toBe(
+		const beforeRewind = await withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
+		expect((await withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload))).requestId).toBe(
 			beforeRewind.requestId,
 		);
 		withRunStorage(storage, () => removeTerminalNotificationOutbox(runId));
-		const afterRewind = withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
+		const afterRewind = await withRunStorage(storage, () => persistTerminalNotificationRequest(runId, payload));
 		expect(afterRewind.requestId).not.toBe(beforeRewind.requestId);
 	});
 
-	it("reclaims an unconfirmed delivery after its lease but never reclaims a confirmation", () => {
+	it("reclaims an unconfirmed delivery after its lease but never reclaims a confirmation", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		const request = withRunStorage(storage, () =>
+		const request = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -360,12 +364,12 @@ describe("terminal notification outbox", () => {
 		).toBe(false);
 	});
 
-	it("recovers a stale dead run by writing the failed request before terminal status", () => {
+	it("recovers a stale dead run by writing the failed request before terminal status", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, {
 				branchIds: ["main"],
 				chartId: "chart",
@@ -375,7 +379,7 @@ describe("terminal notification outbox", () => {
 			}),
 		);
 
-		const request = withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000));
+		const request = await withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000));
 		expect(request?.payload).toMatchObject({ outcome: "failed", error: "worker crashed" });
 		expect(
 			readFileSync(
@@ -383,22 +387,22 @@ describe("terminal notification outbox", () => {
 				"utf8",
 			),
 		).toContain("worker crashed");
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
 			state: "failed",
 			error: "worker crashed",
 			exitCode: 1,
 		});
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))?.requestId).toBe(
+		expect((await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId)))?.requestId).toBe(
 			request?.requestId,
 		);
 	});
 
-	it("preserves a same-attempt outbox written before a hard crash and terminalizes status to its outcome", () => {
+	it("preserves a same-attempt outbox written before a hard crash and terminalizes status to its outcome", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, {
 				branchIds: ["main"],
 				chartId: "chart",
@@ -407,7 +411,7 @@ describe("terminal notification outbox", () => {
 				heartbeatAt: 1,
 			}),
 		);
-		const request = withRunStorage(storage, () =>
+		const request = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -418,24 +422,24 @@ describe("terminal notification outbox", () => {
 			}),
 		);
 
-		expect(withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000))?.requestId).toBe(
+		expect((await withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000)))?.requestId).toBe(
 			request.requestId,
 		);
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({ state: "complete", exitCode: 0 });
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))?.requestId).toBe(
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({ state: "complete", exitCode: 0 });
+		expect((await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId)))?.requestId).toBe(
 			request.requestId,
 		);
 	});
 
-	it("fails a dead resumed attempt instead of inheriting its predecessor before archival", () => {
+	it("fails a dead resumed attempt instead of inheriting its predecessor before archival", async () => {
 		const storage: RunStorage = { kind: "jsonl", rootDir: tempRoot(), layout: "sha256" };
 		const runId = "run";
 		const runDir = resolveRunPaths(runId, storage).runDir;
 		mkdirSync(runDir);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, { branchIds: ["main"], chartId: "chart", state: "complete", attemptId: "attempt-old" }),
 		);
-		const previous = withRunStorage(storage, () =>
+		const previous = await withRunStorage(storage, () =>
 			persistTerminalNotificationRequest(runId, {
 				runId: "run",
 				branchId: "main",
@@ -445,7 +449,7 @@ describe("terminal notification outbox", () => {
 				artifacts: [],
 			}),
 		);
-		withRunStorage(storage, () =>
+		await withRunStorage(storage, () =>
 			patchRunStatus(runId, {
 				state: "starting",
 				attemptId: "attempt-new",
@@ -455,21 +459,21 @@ describe("terminal notification outbox", () => {
 			}),
 		);
 
-		const recovered = withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000));
+		const recovered = await withRunStorage(storage, () => recoverStaleRunTerminalNotification(runId, 20_000));
 		expect(recovered?.requestId).not.toBe(previous.requestId);
 		expect(recovered?.attemptId).toBe("attempt-new");
 		expect(recovered?.payload).toMatchObject({ outcome: "failed", error: "resumed runner died before archival" });
-		expect(withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
+		expect(await withRunStorage(storage, () => readRunStatus(runId))).toMatchObject({
 			state: "failed",
 			attemptId: "attempt-new",
 			exitCode: 1,
 		});
-		expect(withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId))?.requestId).toBe(
+		expect((await withRunStorage(storage, () => readDeliverableTerminalNotificationRequest(runId)))?.requestId).toBe(
 			recovered?.requestId,
 		);
 	});
 
-	it("preserves explicit failed outcomes independently of final names", () => {
+	it("preserves explicit failed outcomes independently of final names", async () => {
 		const ast = normalized(chart({ kind: "chart", id: "named", initial: "done", states: { done: failed() } }));
 		expect(ast.states.done).toMatchObject({ kind: "final", outcome: "failed" });
 	});

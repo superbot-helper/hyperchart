@@ -156,7 +156,7 @@ describe("runId storage identity", () => {
 				expect(controller.canStartBranch("main")).toBe(true);
 				const restart = controller.startBranch("main");
 				await vi.waitFor(() => expect(starts).toBe(2));
-				expect(readRunStatus(f.runId)?.runId).toBe(f.runId);
+				expect((await readRunStatus(f.runId))?.runId).toBe(f.runId);
 				await controller.stop();
 				await restart;
 				await expect(

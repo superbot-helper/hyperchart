@@ -42,11 +42,30 @@ import {
 	registerReplayPageReader,
 } from "./log_store.js";
 import type { StatePath } from "../../core/types.js";
+import {
+	applyRunStatusPatch,
+	normalizeRunStatus,
+	type HyperchartRunStatus,
+	type RunStatusPatch,
+} from "./run_status_model.js";
+import {
+	parseControlRequest,
+	parseControlResult,
+	type RunChangeTopic,
+	type RunChangeWait,
+	type RunnerControlRequest,
+	type RunnerControlResult,
+	type WaitForRunChangeOptions,
+} from "./runner_control_model.js";
 
 export const JOURNAL_TABLE = "hyperchart_journal";
 export const JOURNAL_CHANNEL = "hyperchart_journal";
 export const RUN_META_TABLE = "hyperchart_run_meta";
 export const CHECKPOINT_TABLE = "hyperchart_checkpoint";
+export const RUN_STATUS_TABLE = "hyperchart_run_status";
+export const RUN_STATUS_CHANNEL = "hyperchart_run_status";
+export const CONTROL_TABLE = "hyperchart_control";
+export const CONTROL_CHANNEL = "hyperchart_control";
 const JOURNAL_DDL = `CREATE TABLE IF NOT EXISTS ${JOURNAL_TABLE} (
   run_id text NOT NULL,
   seq bigint NOT NULL,
@@ -97,6 +116,31 @@ const CHECKPOINT_DDL = `CREATE TABLE IF NOT EXISTS ${CHECKPOINT_TABLE} (
   created_at_ms bigint NOT NULL,
   PRIMARY KEY (run_id, checkpoint_id),
   FOREIGN KEY (run_id, head_seq_id) REFERENCES ${JOURNAL_TABLE}(run_id, seq)
+)`;
+/** Operational runner status: one row per run, outside the journal writer claim. */
+const RUN_STATUS_DDL = `CREATE TABLE IF NOT EXISTS ${RUN_STATUS_TABLE} (
+  run_id text PRIMARY KEY,
+  chart_id text NOT NULL,
+  state text NOT NULL,
+  branch_ids jsonb NOT NULL,
+  attempt_id text,
+  pid integer,
+  started_at bigint NOT NULL,
+  updated_at bigint NOT NULL,
+  heartbeat_at bigint,
+  exit_code integer,
+  error text,
+  replay_warnings jsonb
+)`;
+/** Runner control mailbox: requests and results share one table, keyed by role and id. */
+const CONTROL_DDL = `CREATE TABLE IF NOT EXISTS ${CONTROL_TABLE} (
+  run_id text NOT NULL,
+  role text NOT NULL CHECK (role IN ('request', 'result')),
+  id text NOT NULL,
+  attempt_id text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at bigint NOT NULL,
+  PRIMARY KEY (run_id, role, id)
 )`;
 const CHECKPOINT_IDENTITY_DDL = `CREATE UNIQUE INDEX IF NOT EXISTS hyperchart_checkpoint_identity_idx
   ON ${CHECKPOINT_TABLE}(run_id, COALESCE(head_seq_id, -1), selector_key)`;
@@ -217,6 +261,10 @@ function journalNumber(value: string | number): number {
 
 type SharedPgJournal = {
 	client: PgClientLike;
+	/** Return the connection: a pooled read client goes back to its pool, a writer client ends. */
+	release: (destroy?: boolean) => Promise<void>;
+	dsn: string;
+	onWarn: (message: string) => void;
 	runId: string;
 	access: PostgresLogAccess;
 	/** Writer-only durable allocation head, loaded under the advisory lock. */
@@ -293,7 +341,8 @@ export class PostgresLogStore implements RunLogStore {
 	static async open(options: OpenPostgresLogStoreOptions): Promise<PostgresLogStore> {
 		const access = options.access ?? "read";
 		const branchId = options.branchId ?? DEFAULT_BRANCH_ID;
-		const client = await connectPg(options.dsn, options.onWarn ?? (() => {}));
+		const onWarn = options.onWarn ?? (() => {});
+		const { client, release } = await acquirePgClient(options.dsn, access, onWarn);
 		try {
 			if (access === "writer") {
 				await ensureSchema(client);
@@ -325,6 +374,9 @@ export class PostgresLogStore implements RunLogStore {
 				return new PostgresLogStore(
 					{
 						client,
+						release,
+						dsn: options.dsn,
+						onWarn,
 						runId: options.runId,
 						access,
 						nextSeq,
@@ -336,11 +388,21 @@ export class PostgresLogStore implements RunLogStore {
 				);
 			}
 			return new PostgresLogStore(
-				{ client, runId: options.runId, access, writeChain: Promise.resolve(), closed: false, poisoned: false },
+				{
+					client,
+					release,
+					dsn: options.dsn,
+					onWarn,
+					runId: options.runId,
+					access,
+					writeChain: Promise.resolve(),
+					closed: false,
+					poisoned: false,
+				},
 				branchId,
 			);
 		} catch (error) {
-			await client.end().catch(() => {});
+			await release(true).catch(() => {});
 			throw error;
 		}
 	}
@@ -587,12 +649,223 @@ export class PostgresLogStore implements RunLogStore {
 			}
 		});
 	}
+	async readRunStatus(): Promise<HyperchartRunStatus | undefined> {
+		await this.awaitReadable();
+		try {
+			return await readRunStatusDirect(this.journal.client, this.journal.runId);
+		} catch (error) {
+			if (isUndefinedTable(error)) {
+				return undefined;
+			}
+			throw error;
+		}
+	}
+	/**
+	 * Status is operational, not journal truth: read-access handles may patch it and
+	 * a poisoned journal must still record its terminal outcome. The patch is still
+	 * chained behind journal transactions because it shares their connection.
+	 */
+	patchRunStatus(patch: RunStatusPatch): Promise<HyperchartRunStatus> {
+		if (this.journal.closed) {
+			return Promise.reject(new Error("Postgres Hyperchart journal is closed"));
+		}
+		const { client, runId } = this.journal;
+		const task = async (): Promise<HyperchartRunStatus> => {
+			const attempt = async (): Promise<HyperchartRunStatus> => {
+				try {
+					await client.query("BEGIN");
+					const previous = await readRunStatusDirect(client, runId, { forUpdate: true });
+					const next = applyRunStatusPatch(runId, previous, patch);
+					await client.query(
+						`INSERT INTO ${RUN_STATUS_TABLE} (run_id, chart_id, state, branch_ids, attempt_id, pid, started_at, updated_at, heartbeat_at, exit_code, error, replay_warnings)
+						 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
+						 ON CONFLICT (run_id) DO UPDATE SET
+						   chart_id = EXCLUDED.chart_id,
+						   state = EXCLUDED.state,
+						   branch_ids = EXCLUDED.branch_ids,
+						   attempt_id = EXCLUDED.attempt_id,
+						   pid = EXCLUDED.pid,
+						   started_at = EXCLUDED.started_at,
+						   updated_at = EXCLUDED.updated_at,
+						   heartbeat_at = EXCLUDED.heartbeat_at,
+						   exit_code = EXCLUDED.exit_code,
+						   error = EXCLUDED.error,
+						   replay_warnings = EXCLUDED.replay_warnings`,
+						[
+							runId,
+							next.chartId,
+							next.state,
+							JSON.stringify(next.branchIds),
+							next.attemptId ?? null,
+							next.pid ?? null,
+							next.startedAt,
+							next.updatedAt,
+							next.heartbeatAt ?? null,
+							next.exitCode ?? null,
+							next.error ?? null,
+							next.replayWarnings === undefined ? null : JSON.stringify(next.replayWarnings),
+						],
+					);
+					await client.query("SELECT pg_notify($1, $2)", [RUN_STATUS_CHANNEL, runId]);
+					await client.query("COMMIT");
+					return next;
+				} catch (error) {
+					await client.query("ROLLBACK").catch(() => {
+						// A connection stuck inside a transaction must never return to the pool.
+						this.journal.poisoned = true;
+					});
+					throw error;
+				}
+			};
+			try {
+				return await attempt();
+			} catch (error) {
+				// Read-access handles never create the schema up front; a host may publish
+				// "starting" before any writer has touched this database.
+				if (!isUndefinedTable(error)) {
+					throw error;
+				}
+				await ensureSchema(client);
+				return await attempt();
+			}
+		};
+		const result = this.journal.writeChain.then(task);
+		this.journal.writeChain = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	publishControlRequest(request: RunnerControlRequest): Promise<void> {
+		return this.controlWrite(async (client, runId) => {
+			const inserted = await client.query(
+				`INSERT INTO ${CONTROL_TABLE} (run_id, role, id, attempt_id, payload, created_at)
+				 VALUES ($1, 'request', $2, $3, $4::jsonb, $5)
+				 ON CONFLICT DO NOTHING RETURNING id`,
+				[runId, request.id, request.attemptId, JSON.stringify(request), request.createdAt],
+			);
+			if (inserted.rows.length !== 1) {
+				throw new Error(`Control request '${request.id}' already exists for Hyperchart run '${runId}'`);
+			}
+			await client.query("SELECT pg_notify($1, $2)", [CONTROL_CHANNEL, runId]);
+		});
+	}
+	async listControlRequests(): Promise<readonly RunnerControlRequest[]> {
+		await this.awaitReadable();
+		const { client, runId } = this.journal;
+		let rows: Record<string, unknown>[];
+		try {
+			rows = (
+				await client.query(
+					`SELECT id, payload FROM ${CONTROL_TABLE} WHERE run_id = $1 AND role = 'request' ORDER BY created_at, id`,
+					[runId],
+				)
+			).rows;
+		} catch (error) {
+			if (isUndefinedTable(error)) {
+				return [];
+			}
+			throw error;
+		}
+		const requests: RunnerControlRequest[] = [];
+		for (const row of rows) {
+			const request = parseControlRequest(row.payload);
+			if (request === undefined) {
+				await this.discardControlRequest(row.id as string);
+				continue;
+			}
+			requests.push(request);
+		}
+		return requests;
+	}
+	discardControlRequest(requestId: string): Promise<void> {
+		return this.controlWrite(async (client, runId) => {
+			await client.query(`DELETE FROM ${CONTROL_TABLE} WHERE run_id = $1 AND role = 'request' AND id = $2`, [
+				runId,
+				requestId,
+			]);
+		});
+	}
+	publishControlResult(result: RunnerControlResult): Promise<boolean> {
+		return this.controlWrite(async (client, runId) => {
+			const inserted = await client.query(
+				`INSERT INTO ${CONTROL_TABLE} (run_id, role, id, attempt_id, payload, created_at)
+				 VALUES ($1, 'result', $2, $3, $4::jsonb, $5)
+				 ON CONFLICT DO NOTHING RETURNING id`,
+				[runId, result.requestId, result.attemptId, JSON.stringify(result), result.completedAt],
+			);
+			if (inserted.rows.length !== 1) {
+				return false;
+			}
+			await client.query("SELECT pg_notify($1, $2)", [CONTROL_CHANNEL, runId]);
+			return true;
+		});
+	}
+	async readControlResult(requestId: string): Promise<RunnerControlResult | undefined> {
+		await this.awaitReadable();
+		try {
+			const result = await this.journal.client.query(
+				`SELECT payload FROM ${CONTROL_TABLE} WHERE run_id = $1 AND role = 'result' AND id = $2`,
+				[this.journal.runId, requestId],
+			);
+			return parseControlResult(result.rows[0]?.payload);
+		} catch (error) {
+			if (isUndefinedTable(error)) {
+				return undefined;
+			}
+			throw error;
+		}
+	}
+	discardControlResult(requestId: string): Promise<void> {
+		return this.controlWrite(async (client, runId) => {
+			await client.query(`DELETE FROM ${CONTROL_TABLE} WHERE run_id = $1 AND role = 'result' AND id = $2`, [
+				runId,
+				requestId,
+			]);
+		});
+	}
+	watchRunChange(topics: readonly RunChangeTopic[], options: WaitForRunChangeOptions): RunChangeWait {
+		const channels = topics.map((topic) => (topic === "status" ? RUN_STATUS_CHANNEL : CONTROL_CHANNEL));
+		return watchNotification(this.journal.dsn, this.journal.onWarn, this.journal.runId, channels, options);
+	}
+	/**
+	 * Control rows are operational like status: read-access handles write them, the
+	 * schema is created lazily, and each statement is chained behind journal
+	 * transactions because it shares their connection.
+	 */
+	private controlWrite<T>(task: (client: PgClientLike, runId: string) => Promise<T>): Promise<T> {
+		if (this.journal.closed) {
+			return Promise.reject(new Error("Postgres Hyperchart journal is closed"));
+		}
+		const { client, runId } = this.journal;
+		const run = async (): Promise<T> => {
+			try {
+				return await task(client, runId);
+			} catch (error) {
+				if (!isUndefinedTable(error)) {
+					throw error;
+				}
+				await ensureSchema(client);
+				return await task(client, runId);
+			}
+		};
+		const result = this.journal.writeChain.then(run);
+		this.journal.writeChain = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
 	deleteRunData(): Promise<void> {
 		return this.enqueueWrite(async () => {
 			const { client, runId } = this.journal;
 			try {
 				await client.query("BEGIN");
 				await client.query(`DELETE FROM ${CHECKPOINT_TABLE} WHERE run_id = $1`, [runId]);
+				await client.query(`DELETE FROM ${CONTROL_TABLE} WHERE run_id = $1`, [runId]);
+				await client.query(`DELETE FROM ${RUN_STATUS_TABLE} WHERE run_id = $1`, [runId]);
 				await client.query(`DELETE FROM ${RUN_META_TABLE} WHERE run_id = $1`, [runId]);
 				await client.query(`DELETE FROM ${JOURNAL_TABLE} WHERE run_id = $1`, [runId]);
 				await client.query("COMMIT");
@@ -684,7 +957,7 @@ export class PostgresLogStore implements RunLogStore {
 					await client.query("ROLLBACK").catch(() => {});
 				} else {
 					this.journal.poisoned = true;
-					await client.end().catch(() => {});
+					await this.journal.release(true).catch(() => {});
 				}
 				throw normalizeUnique(error, runId);
 			}
@@ -731,7 +1004,7 @@ export class PostgresLogStore implements RunLogStore {
 		}
 		this.journal.closed = true;
 		await this.journal.writeChain.catch(() => {});
-		await this.journal.client.end().catch(() => {});
+		await this.journal.release(this.journal.poisoned).catch(() => {});
 	}
 	private enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
 		if (this.journal.access !== "writer") {
@@ -1008,19 +1281,224 @@ class TransactionImpl implements PostgresRunTransaction {
 	}
 }
 
-async function connectPg(dsn: string, onWarn: (message: string) => void): Promise<PgClientLike> {
-	let pg: { Client: new (config: { connectionString: string }) => PgClientLike };
+type PgPoolClientLike = PgClientLike & { release(destroy?: boolean | Error): void };
+type PgPoolLike = {
+	connect(): Promise<PgPoolClientLike>;
+	on(event: "error", listener: (error: Error) => void): unknown;
+};
+type PgModule = {
+	Client: new (config: { connectionString: string }) => PgClientLike;
+	Pool: new (config: {
+		connectionString: string;
+		max: number;
+		idleTimeoutMillis: number;
+		allowExitOnIdle: boolean;
+	}) => PgPoolLike;
+};
+
+async function loadPg(): Promise<PgModule> {
 	try {
-		pg = (await import("pg")) as unknown as typeof pg;
+		return (await import("pg")) as unknown as PgModule;
 	} catch {
 		throw new Error(
 			"Postgres Hyperchart log storage requires the optional 'pg' package; install it to use HYPERCHART_PG_DSN",
 		);
 	}
-	const client = new pg.Client({ connectionString: dsn });
-	client.on("error", (error) => onWarn(`Hyperchart Postgres journal connection error: ${error.message}`));
-	await client.connect();
-	return client;
+}
+
+/**
+ * Read handles are opened and closed constantly: every host status read, poll tick,
+ * TUI refresh, and Inspector request. They hold no session state (no advisory lock,
+ * no LISTEN), so they share one pool per DSN and only pay a connection handshake when
+ * the pool is cold. Idle pooled connections never keep the process alive.
+ */
+const readPools = new Map<string, PgPoolLike>();
+
+/**
+ * One LISTEN connection per DSN per process, created on the first waiter and
+ * ended shortly after the last one leaves. Notifications are wake-up hints keyed
+ * by run id; waiters always re-read state and always have a fallback timeout, so a
+ * dropped connection costs latency, never correctness.
+ */
+type PgNotification = { channel: string; payload?: string | undefined };
+type PgListenClientLike = PgClientLike & {
+	on(event: "notification", listener: (message: PgNotification) => void): unknown;
+};
+type Listener = {
+	client: Promise<PgListenClientLike>;
+	waiters: Set<(channel: string, runId: string) => void>;
+	idleTimer: NodeJS.Timeout | undefined;
+	broken: boolean;
+};
+const listeners = new Map<string, Listener>();
+const LISTENER_IDLE_MS = 10_000;
+const LISTEN_CHANNELS = [RUN_STATUS_CHANNEL, CONTROL_CHANNEL];
+
+function listenerFor(dsn: string, onWarn: (message: string) => void): Listener {
+	const existing = listeners.get(dsn);
+	if (existing !== undefined && !existing.broken) {
+		return existing;
+	}
+	const listener: Listener = {
+		client: undefined as unknown as Promise<PgListenClientLike>,
+		waiters: new Set(),
+		idleTimer: undefined,
+		broken: false,
+	};
+	listener.client = (async () => {
+		const pg = await loadPg();
+		const client = new pg.Client({ connectionString: dsn }) as PgListenClientLike;
+		client.on("error", (error) => {
+			onWarn(`Hyperchart Postgres listener error: ${error.message}`);
+			listener.broken = true;
+			if (listeners.get(dsn) === listener) {
+				listeners.delete(dsn);
+			}
+			client.end().catch(() => {});
+		});
+		client.on("notification", (message) => {
+			if (message.payload === undefined) {
+				return;
+			}
+			for (const waiter of listener.waiters) {
+				waiter(message.channel, message.payload);
+			}
+		});
+		await client.connect();
+		for (const channel of LISTEN_CHANNELS) {
+			await client.query(`LISTEN ${channel}`);
+		}
+		return client;
+	})();
+	listener.client.catch(() => {
+		listener.broken = true;
+		if (listeners.get(dsn) === listener) {
+			listeners.delete(dsn);
+		}
+	});
+	listeners.set(dsn, listener);
+	return listener;
+}
+
+function releaseListener(dsn: string, listener: Listener): void {
+	if (listener.waiters.size > 0 || listener.idleTimer !== undefined) {
+		return;
+	}
+	listener.idleTimer = setTimeout(() => {
+		listener.idleTimer = undefined;
+		if (listener.waiters.size > 0) {
+			return;
+		}
+		if (listeners.get(dsn) === listener) {
+			listeners.delete(dsn);
+		}
+		listener.broken = true;
+		listener.client.then((client) => client.end()).catch(() => {});
+	}, LISTENER_IDLE_MS);
+	listener.idleTimer.unref();
+}
+
+function watchNotification(
+	dsn: string,
+	onWarn: (message: string) => void,
+	runId: string,
+	channels: readonly string[],
+	options: WaitForRunChangeOptions,
+): RunChangeWait {
+	let cancel: () => void = () => {};
+	const changed = new Promise<void>((resolve, reject) => {
+		if (options.signal?.aborted) {
+			reject(options.signal.reason);
+			return;
+		}
+		const listener = listenerFor(dsn, onWarn);
+		if (listener.idleTimer !== undefined) {
+			clearTimeout(listener.idleTimer);
+			listener.idleTimer = undefined;
+		}
+		const finish = () => {
+			clearTimeout(timer);
+			listener.waiters.delete(waiter);
+			options.signal?.removeEventListener("abort", onAbort);
+			releaseListener(dsn, listener);
+		};
+		const waiter = (channel: string, notifiedRunId: string) => {
+			if (notifiedRunId === runId && channels.includes(channel)) {
+				finish();
+				resolve();
+			}
+		};
+		const onAbort = () => {
+			finish();
+			reject(options.signal?.reason);
+		};
+		const timer = setTimeout(() => {
+			finish();
+			resolve();
+		}, options.timeoutMs);
+		if (options.persistent !== true) {
+			timer.unref();
+		}
+		cancel = () => {
+			finish();
+			resolve();
+		};
+		listener.waiters.add(waiter);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		// A listener that cannot connect leaves the fallback timeout in charge.
+		listener.client.catch(() => {});
+	});
+	return { changed, cancel: () => cancel() };
+}
+const READ_POOL_MAX = 8;
+const READ_POOL_IDLE_MS = 10_000;
+
+async function readPool(dsn: string, onWarn: (message: string) => void): Promise<PgPoolLike> {
+	const existing = readPools.get(dsn);
+	if (existing !== undefined) {
+		return existing;
+	}
+	const pg = await loadPg();
+	const pool = new pg.Pool({
+		connectionString: dsn,
+		max: READ_POOL_MAX,
+		idleTimeoutMillis: READ_POOL_IDLE_MS,
+		allowExitOnIdle: true,
+	});
+	pool.on("error", (error) => onWarn(`Hyperchart Postgres read pool error: ${error.message}`));
+	readPools.set(dsn, pool);
+	return pool;
+}
+
+/**
+ * A writer needs its own session: the run advisory lock and the allocation head
+ * live for the connection's lifetime, so it is ended on close. A reader borrows a
+ * pooled connection and returns it, destroying it only when it may be mid-transaction.
+ */
+async function acquirePgClient(
+	dsn: string,
+	access: PostgresLogAccess,
+	onWarn: (message: string) => void,
+): Promise<{ client: PgClientLike; release: (destroy?: boolean) => Promise<void> }> {
+	if (access === "writer") {
+		const pg = await loadPg();
+		const client = new pg.Client({ connectionString: dsn });
+		client.on("error", (error) => onWarn(`Hyperchart Postgres journal connection error: ${error.message}`));
+		await client.connect();
+		return { client, release: () => client.end() };
+	}
+	const client = await (await readPool(dsn, onWarn)).connect();
+	let released = false;
+	return {
+		client,
+		release: async (destroy = false) => {
+			if (released) {
+				return;
+			}
+			released = true;
+			client.release(destroy);
+		},
+	};
 }
 /**
  * Creates the journal, run-meta, and checkpoint tables and their indexes.
@@ -1040,6 +1518,8 @@ async function ensureSchema(client: PgClientLike): Promise<void> {
 			RUN_META_DDL,
 			CHECKPOINT_DDL,
 			CHECKPOINT_IDENTITY_DDL,
+			RUN_STATUS_DDL,
+			CONTROL_DDL,
 		]) {
 			await client.query(ddl);
 		}
@@ -1364,6 +1844,42 @@ function requireBranch(branch: BranchHead | undefined, branchId: BranchId): Bran
 	}
 	return branch;
 }
+async function readRunStatusDirect(
+	client: PgClientLike,
+	runId: string,
+	options: { forUpdate?: boolean } = {},
+): Promise<HyperchartRunStatus | undefined> {
+	const result = await client.query(
+		`SELECT chart_id, state, branch_ids, attempt_id, pid, started_at, updated_at, heartbeat_at, exit_code, error, replay_warnings
+		 FROM ${RUN_STATUS_TABLE} WHERE run_id = $1${options.forUpdate === true ? " FOR UPDATE" : ""}`,
+		[runId],
+	);
+	const row = result.rows[0];
+	if (row === undefined) {
+		return undefined;
+	}
+	const optionalNumber = (value: unknown) => (value === null || value === undefined ? undefined : pgNumber(value));
+	const optionalString = (value: unknown) => (value === null || value === undefined ? undefined : (value as string));
+	return normalizeRunStatus(
+		{
+			version: 2,
+			runId,
+			chartId: row.chart_id,
+			state: row.state,
+			branchIds: row.branch_ids,
+			attemptId: optionalString(row.attempt_id),
+			pid: optionalNumber(row.pid),
+			startedAt: pgNumber(row.started_at),
+			updatedAt: pgNumber(row.updated_at),
+			heartbeatAt: optionalNumber(row.heartbeat_at),
+			exitCode: optionalNumber(row.exit_code),
+			error: optionalString(row.error),
+			replayWarnings: row.replay_warnings ?? undefined,
+		},
+		runId,
+	);
+}
+
 function decodeRunMeta(row: Record<string, unknown>): RunMeta {
 	const exportName =
 		row.export_name === null || row.export_name === undefined ? undefined : (row.export_name as string);

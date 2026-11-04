@@ -76,7 +76,7 @@ function strictViolations(node: unknown, path = "$"): string[] {
 
 describe("toStrictJsonSchema", () => {
 	it("turns a nested discriminated-union batch into the strict subset", () => {
-		const strict = toStrictJsonSchema(Batch);
+		const strict = toStrictJsonSchema(z.toJSONSchema(Batch) as JsonSchema);
 		expect(strictViolations(strict)).toEqual([]);
 		const candidates = (strict.properties as Record<string, JsonSchema>).candidates as JsonSchema;
 		const variants = (candidates.items as JsonSchema).anyOf as JsonSchema[];
@@ -87,19 +87,22 @@ describe("toStrictJsonSchema", () => {
 		]);
 	});
 
-	it("leaves the authored Zod schema and its plain JSON Schema unchanged", () => {
-		const before = JSON.stringify(z.toJSONSchema(Batch));
-		toStrictJsonSchema(Batch);
-		expect(JSON.stringify(z.toJSONSchema(Batch))).toBe(before);
+	it("does not modify the input schema", () => {
+		const schema = z.toJSONSchema(Batch) as JsonSchema;
+		const before = JSON.stringify(schema);
+		toStrictJsonSchema(schema);
+		expect(JSON.stringify(schema)).toBe(before);
 	});
 
 	it("requires optional properties as nullable and keeps nullable ones as they are", () => {
 		const strict = toStrictJsonSchema(
-			z.object({
-				note: z.string().optional(),
-				plan: Plan.optional(),
-				score: z.number().nullable(),
-			}),
+			z.toJSONSchema(
+				z.object({
+					note: z.string().optional(),
+					plan: Plan.optional(),
+					score: z.number().nullable(),
+				}),
+			) as JsonSchema,
 		);
 		expect(strictViolations(strict)).toEqual([]);
 		expect(strict.properties).toEqual({

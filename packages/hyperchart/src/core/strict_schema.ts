@@ -1,26 +1,19 @@
-import { z, type ZodType } from "zod";
 import type { JsonSchema } from "./types.js";
 
 // Keywords that strict constrained-decoding modes (OpenAI, DeepSeek) reject or ignore. The
-// constraints they carry are still enforced by validating the completion against the Zod schema.
-const UNSUPPORTED_KEYWORDS = ["minLength", "maxLength", "minItems", "maxItems", "default"] as const;
+// constraints they carry are still enforced by validating the completion against the original
+// schema.
+const UNSUPPORTED_KEYWORDS = ["$schema", "minLength", "maxLength", "minItems", "maxItems", "default"] as const;
 
 /**
- * Converts a Zod schema into the JSON Schema subset accepted by strict tool-call modes:
- * every object property is required, optional properties become nullable, `oneOf` becomes
- * `anyOf`, `const` becomes a one-value `enum`, and unsupported keywords are dropped.
- * Optional values the model returns as `null` are restored by {@link fromStrictValue}.
+ * Converts a chart's JSON Schema (the Zod conversion stored in the AST) into the subset accepted
+ * by strict tool-call modes: every object property is required, optional properties become
+ * nullable, `oneOf` becomes `anyOf`, `const` becomes a one-value `enum`, and unsupported
+ * keywords are dropped. The input is not modified. Optional values the model returns as `null`
+ * are restored by {@link fromStrictValue}.
  */
-export function toStrictJsonSchema(schema: ZodType): JsonSchema {
-	const strict = z.toJSONSchema(schema, {
-		reused: "inline",
-		override: ({ jsonSchema }) => strictNode(jsonSchema as JsonSchema),
-	}) as JsonSchema;
-	delete strict.$schema;
-	return strict;
-}
-
-function strictNode(node: JsonSchema): void {
+export function toStrictJsonSchema(schema: JsonSchema): JsonSchema {
+	const node: JsonSchema = { ...schema };
 	if (node.oneOf !== undefined) {
 		node.anyOf = node.oneOf;
 		delete node.oneOf;
@@ -32,17 +25,28 @@ function strictNode(node: JsonSchema): void {
 	for (const keyword of UNSUPPORTED_KEYWORDS) {
 		delete node[keyword];
 	}
+	if (Array.isArray(node.anyOf)) {
+		node.anyOf = (node.anyOf as JsonSchema[]).map(toStrictJsonSchema);
+	}
+	if (isSchema(node.items)) {
+		node.items = toStrictJsonSchema(node.items);
+	}
 	const properties = node.properties as Record<string, JsonSchema> | undefined;
-	if (node.type !== "object" || properties === undefined) {
-		return;
+	if (properties !== undefined) {
+		const required = new Set((node.required as string[] | undefined) ?? []);
+		node.properties = Object.fromEntries(
+			Object.entries(properties).map(([key, property]) => {
+				const strict = toStrictJsonSchema(property);
+				return [key, required.has(key) || allowsNull(strict) ? strict : nullable(strict)];
+			}),
+		);
+		node.required = Object.keys(properties);
 	}
-	const required = new Set((node.required as string[] | undefined) ?? []);
-	for (const [key, property] of Object.entries(properties)) {
-		if (!required.has(key) && !allowsNull(property)) {
-			properties[key] = nullable(property);
-		}
-	}
-	node.required = Object.keys(properties);
+	return node;
+}
+
+function isSchema(value: unknown): value is JsonSchema {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function allowsNull(node: JsonSchema): boolean {
@@ -54,7 +58,6 @@ function allowsNull(node: JsonSchema): boolean {
 	return variants?.some(allowsNull) ?? false;
 }
 
-// Wraps rather than copies: the override may still visit `node` itself later.
 function nullable(node: JsonSchema): JsonSchema {
 	return { anyOf: [node, { type: "null" }] };
 }
@@ -66,8 +69,7 @@ function nullable(node: JsonSchema): JsonSchema {
  */
 export function fromStrictValue(value: unknown, schema: JsonSchema): unknown {
 	if (Array.isArray(value)) {
-		const items = schema.items as JsonSchema | undefined;
-		return items === undefined ? value : value.map((item) => fromStrictValue(item, items));
+		return isSchema(schema.items) ? value.map((item) => fromStrictValue(item, schema.items as JsonSchema)) : value;
 	}
 	if (value === null || typeof value !== "object") {
 		return value;

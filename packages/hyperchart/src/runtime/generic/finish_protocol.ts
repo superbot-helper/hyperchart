@@ -1,6 +1,7 @@
 import type { ChartEvent } from "../../core/types.js";
 import type { AgentEffect } from "../../core/machine.js";
 import type { SchemaRegistryLike as SchemaRegistry } from "../../core/schema_registry.js";
+import { fromStrictValue, toStrictJsonSchema } from "../../core/strict_schema.js";
 import { checkSchemaAsync } from "./schema.js";
 
 /**
@@ -23,11 +24,15 @@ export async function validateFinishParams(
 	registry?: SchemaRegistry,
 ): Promise<{ ok: true; event: ChartEvent } | { ok: false; errors: string[] }> {
 	const errors = validateFinishBasics(effect, params);
+	let output = params.output;
 	if (effect.reply !== undefined) {
 		if (!("output" in params)) {
 			errors.push("output is required for this completion event");
 		} else {
-			const check = await checkSchemaAsync(effect.reply, params.output, registry);
+			// A strict finish schema makes optional properties nullable; a null there is never valid
+			// for the reply schema, so it is read as the property being absent.
+			output = fromStrictValue(params.output, effect.reply.schema);
+			const check = await checkSchemaAsync(effect.reply, output, registry);
 			if (!check.ok) {
 				errors.push(...check.errors.map((message) => `output ${message}`));
 			}
@@ -37,7 +42,7 @@ export async function validateFinishParams(
 		? { ok: false, errors }
 		: {
 				ok: true,
-				event: { type: params.event as string, ...(params.output === undefined ? {} : { output: params.output }) },
+				event: { type: params.event as string, ...(output === undefined ? {} : { output }) },
 			};
 }
 
@@ -60,13 +65,18 @@ function validateFinishBasics(effect: AgentEffect, params: FinishParams): string
 	return errors;
 }
 
-export function buildFinishSchema(effect: AgentEffect): Record<string, unknown> {
+/**
+ * The `finish` parameter schema. With `strict`, the reply schema is converted to the subset that
+ * strict tool-call modes accept; {@link validateFinishParams} still checks the original schema.
+ */
+export function buildFinishSchema(effect: AgentEffect, options: { strict?: boolean } = {}): Record<string, unknown> {
 	const events = finishableEvents(effect);
+	const reply = effect.reply?.schema;
 	return {
 		type: "object",
 		properties: {
 			event: { type: "string", enum: events },
-			...(effect.reply === undefined ? {} : { output: effect.reply.schema }),
+			...(reply === undefined ? {} : { output: options.strict === true ? toStrictJsonSchema(reply) : reply }),
 		},
 		required: effect.reply === undefined ? ["event"] : ["event", "output"],
 		additionalProperties: false,

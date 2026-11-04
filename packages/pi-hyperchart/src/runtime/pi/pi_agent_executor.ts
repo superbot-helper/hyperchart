@@ -36,6 +36,7 @@ import {
 } from "@surprisal/hyperchart/runtime";
 import { loadAgentDefinition, resolvePiSubagentDefinitionDirs, type AgentDefinition } from "./agent_definitions.js";
 import { createFinishTool, type CompletionSink, validateFinishParams } from "./finish_tool.js";
+import { strictFinishExtension } from "./strict_finish.js";
 import { createThrottledProgressWriter, updateSessionProgress } from "@surprisal/hyperchart/sessions";
 
 export { buildSessionPlan, shouldRecoverRestoredFinish, validateDeclaredReadPaths };
@@ -63,6 +64,11 @@ export type PiSessionOverrides = Readonly<{
 	appendSystemPrompt?: string;
 	/** Custom tools registered only for this invocation. */
 	customTools?: ToolDefinition[];
+	/**
+	 * Ask the provider to constrain `finish` arguments to the strict-mode finish schema. Enable
+	 * only for routes whose providers honor strict tool calls.
+	 */
+	strictFinish?: boolean;
 }>;
 
 export type PiSessionHandle = Readonly<{
@@ -107,8 +113,9 @@ export function createInvocationCustomTools(
 	sink: CompletionSink,
 	registry: SchemaRegistry | undefined,
 	customTools: readonly ToolDefinition[] | undefined,
+	options: { strictFinish?: boolean } = {},
 ): ToolDefinition[] {
-	return [...(customTools ?? []), createFinishTool(effect, sink, registry)];
+	return [...(customTools ?? []), createFinishTool(effect, sink, registry, { strict: options.strictFinish === true })];
 }
 
 export function sessionIdForAttempt(sessionId: string, attempt: number): string {
@@ -504,6 +511,8 @@ export class PiAgentExecutor implements AgentExecutor {
 			modelRuntime: this.options.modelRuntime,
 			resourceLoaderOptions: {
 				noExtensions: this.options.extensionPolicy === "isolated",
+				// Inline extensions load under either policy.
+				...(overrides?.strictFinish === true ? { extensionFactories: [strictFinishExtension()] } : {}),
 				...(plan.promptMode === "append"
 					? { appendSystemPromptOverride: (base: string[]) => [...base, invocationSystemPrompt] }
 					: {
@@ -551,7 +560,9 @@ export class PiAgentExecutor implements AgentExecutor {
 				...(model === undefined ? {} : { model }),
 				...(plan.thinkingLevel === undefined ? {} : { thinkingLevel: plan.thinkingLevel }),
 				...(tools === undefined ? {} : { tools }),
-				customTools: createInvocationCustomTools(effect, sink, this.options.schemaRegistry, overrides?.customTools),
+				customTools: createInvocationCustomTools(effect, sink, this.options.schemaRegistry, overrides?.customTools, {
+					strictFinish: overrides?.strictFinish === true,
+				}),
 				sessionManager,
 			}));
 		} catch (error) {

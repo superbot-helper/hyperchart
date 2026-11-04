@@ -13,13 +13,23 @@ import {
 export { finishableEvents, validateFinishParams };
 export type { CompletionSink };
 
-export function createFinishTool(effect: AgentEffect, sink: CompletionSink, registry?: SchemaRegistry): ToolDefinition {
+/**
+ * With `strict`, the parameters are the strict-mode schema, so Pi's own argument check accepts
+ * the nulls a provider writes for optional properties; the request still needs `strict: true`
+ * on the function for the provider to constrain decoding (see strict_finish.ts).
+ */
+export function createFinishTool(
+	effect: AgentEffect,
+	sink: CompletionSink,
+	registry?: SchemaRegistry,
+	options: { strict?: boolean } = {},
+): ToolDefinition {
 	return defineTool({
 		name: "finish",
 		label: "Finish",
 		description: "Call exactly once when the task is complete. This ends the assignment.",
 		promptSnippet: "Finish the hyperchart assignment with a typed completion event",
-		parameters: Type.Unsafe(buildFinishSchema(effect) as TSchema),
+		parameters: Type.Unsafe(buildFinishSchema(effect, options) as TSchema),
 		async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
 			const result = await validateFinishParams(effect, params as FinishParams, registry);
 			if (!result.ok) {

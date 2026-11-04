@@ -1,4 +1,9 @@
-import { defineTool, type AgentToolResult, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentSession,
+	defineTool,
+	type AgentToolResult,
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { AgentEffect } from "@surprisal/hyperchart/internal/core/machine";
 import type { SchemaRegistryLike as SchemaRegistry } from "@surprisal/hyperchart/internal/core/schema_registry";
@@ -30,13 +35,14 @@ export function createFinishTool(
 		description: "Call exactly once when the task is complete. This ends the assignment.",
 		promptSnippet: "Finish the hyperchart assignment with a typed completion event",
 		parameters: Type.Unsafe(buildFinishSchema(effect, options) as TSchema),
+		// Rejections throw: Pi marks a tool result as an error only when execute throws.
 		async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
 			const result = await validateFinishParams(effect, params as FinishParams, registry);
 			if (!result.ok) {
-				return toolError(result.errors.join("\n"));
+				throw new Error(result.errors.join("\n"));
 			}
 			if (sink.captured !== undefined) {
-				return toolError("finish has already been called for this assignment");
+				throw new Error("finish has already been called for this assignment");
 			}
 			sink.captured = result.event;
 			return {
@@ -48,10 +54,19 @@ export function createFinishTool(
 	}) as ToolDefinition;
 }
 
-function toolError(message: string): AgentToolResult<unknown> & { isError: true } {
-	return {
-		content: [{ type: "text", text: message }],
-		details: { error: message },
-		isError: true,
+type StopAfterTurn = NonNullable<AgentSession["agent"]["shouldStopAfterTurn"]>;
+
+/**
+ * Ends the turn after a rejected `finish`, whether Pi's argument check or validateFinishParams
+ * rejected it, so each rejection is a failed turn that spends the action's recovery budget.
+ */
+export function stopAfterRejectedFinish(sink: CompletionSink): StopAfterTurn {
+	return ({ toolResults }) => {
+		const rejected = toolResults.find((result) => result.toolName === "finish" && result.isError);
+		if (rejected === undefined) {
+			return false;
+		}
+		sink.rejection = rejected.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+		return true;
 	};
 }

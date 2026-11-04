@@ -35,7 +35,7 @@ import {
 	validateDeclaredReadPaths,
 } from "@surprisal/hyperchart/runtime";
 import { loadAgentDefinition, resolvePiSubagentDefinitionDirs, type AgentDefinition } from "./agent_definitions.js";
-import { createFinishTool, type CompletionSink, validateFinishParams } from "./finish_tool.js";
+import { createFinishTool, type CompletionSink, stopAfterRejectedFinish, validateFinishParams } from "./finish_tool.js";
 import { strictFinishExtension } from "./strict_finish.js";
 import { createThrottledProgressWriter, updateSessionProgress } from "@surprisal/hyperchart/sessions";
 
@@ -569,6 +569,8 @@ export class PiAgentExecutor implements AgentExecutor {
 			await this.closeSessionHandle(sessionHandle);
 			throw error;
 		}
+		// No session option exists; Pi sets its own tool hooks on the agent the same way.
+		session.agent.shouldStopAfterTurn = stopAfterRejectedFinish(sink);
 		if (sessionHandle !== undefined) {
 			this.sessionHandles.set(session, sessionHandle);
 		}

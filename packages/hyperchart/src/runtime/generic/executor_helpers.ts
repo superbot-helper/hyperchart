@@ -165,6 +165,13 @@ export async function evaluateAgentTurn(options: EvaluateAgentTurnOptions): Prom
 				failure: { kind: "provider", retryable: isTransientProviderFailure(assistantError), message: assistantError },
 			};
 		}
+		// A rejected finish ends the turn, so each rejection spends the recovery budget.
+		if (options.sink.rejection !== undefined) {
+			return {
+				kind: "failed",
+				failure: { kind: "validation", retryable: true, message: `finish was rejected:\n${options.sink.rejection}` },
+			};
+		}
 		return {
 			kind: "failed",
 			failure: {

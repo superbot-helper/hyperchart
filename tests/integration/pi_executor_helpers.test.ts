@@ -440,40 +440,19 @@ describe("finish tool", () => {
 		expect(sink.captured).toEqual({ type: "DONE", output: { value: 3 } });
 	});
 
-	it("returns a tool error for invalid output, FAILED, and double calls", async () => {
+	it("rejects invalid output, FAILED, and double calls by throwing", async () => {
 		const currentEffect = effect();
 		const sink: CompletionSink = { captured: undefined };
 		const tool = createFinishTool(currentEffect, sink);
+		const call = (params: unknown) => tool.execute("call", params as never, undefined, undefined, {} as never);
 
-		const invalid = (await tool.execute(
-			"call",
-			{ event: "DONE", output: { value: "bad" } },
-			undefined,
-			undefined,
-			{} as never,
-		)) as { isError?: boolean };
-		expect(invalid.isError).toBe(true);
+		await expect(call({ event: "DONE", output: { value: "bad" } })).rejects.toThrow("output");
+		expect(sink.captured).toBeUndefined();
+		await expect(call({ event: "FAILED", output: { value: 1 } })).rejects.toThrow("FAILED is reserved");
 		expect(sink.captured).toBeUndefined();
 
-		const failed = (await tool.execute(
-			"call",
-			{ event: "FAILED", output: { value: 1 } },
-			undefined,
-			undefined,
-			{} as never,
-		)) as { isError?: boolean };
-		expect(failed.isError).toBe(true);
-		expect(sink.captured).toBeUndefined();
-
-		await tool.execute("call", { event: "DONE", output: { value: 1 } }, undefined, undefined, {} as never);
-		const second = (await tool.execute(
-			"call",
-			{ event: "DONE", output: { value: 2 } },
-			undefined,
-			undefined,
-			{} as never,
-		)) as { isError?: boolean };
-		expect(second.isError).toBe(true);
+		await call({ event: "DONE", output: { value: 1 } });
+		await expect(call({ event: "DONE", output: { value: 2 } })).rejects.toThrow("already been called");
 		expect(sink.captured).toEqual({ type: "DONE", output: { value: 1 } });
 	});
 });

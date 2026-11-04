@@ -10,7 +10,11 @@ import { checkSchemaAsync } from "./schema.js";
  * the captured-completion sink are shared so completion semantics cannot drift
  * between hosts.
  */
-export type CompletionSink = { captured: ChartEvent | undefined };
+export type CompletionSink = {
+	captured: ChartEvent | undefined;
+	/** Why `finish` was rejected when a host ends the turn on a rejected finish call. */
+	rejection?: string;
+};
 
 export type FinishParams = { event?: unknown; output?: unknown };
 
